@@ -79,23 +79,17 @@ def _get(obj, *names, default=None):
 
 
 def fetch_free_news(today_only=True):
-    """
-    Fetch news. If today_only=True, tries to get only today's events.
-    Falls back to full calendar + client-side filter.
-    """
     try:
         from biquote import Biquote
         bq = Biquote()
 
         events = None
         if today_only:
-            # Try date-range fetch first
             today = date.today()
             try:
                 events = bq.calendar(from_date=today, to_date=today)
                 print(f"[i] biquote date-range fetch returned {len(events) if events else 0} events.")
             except TypeError:
-                # Older biquote versions may not accept from_date/to_date
                 print("[i] biquote does not support date-range — falling back to full calendar.")
                 events = None
             except Exception as ex:
@@ -110,7 +104,6 @@ def fetch_free_news(today_only=True):
             fields = sample.keys() if isinstance(sample, dict) else vars(sample)
             print(f"[i] Sample fields: {list(fields)}")
 
-        # Filter to today (Tehran date) if needed
         if today_only:
             today_tehran = datetime.now(TEHRAN_TZ).date()
             filtered = []
@@ -125,7 +118,7 @@ def fetch_free_news(today_only=True):
                     if dt.astimezone(TEHRAN_TZ).date() == today_tehran:
                         filtered.append(e)
                 except Exception:
-                    filtered.append(e)   # keep unparsable, don't lose it
+                    filtered.append(e)
             print(f"[i] Filtered to today (Tehran): {len(filtered)} events.")
             events = filtered
 
@@ -246,7 +239,6 @@ def to_utc(iso_str):
 
 
 def to_iso_utc(iso_str):
-    """Return ISO-8601 UTC string for JS parsing."""
     dt = parse_iso(iso_str)
     if dt is None:
         return ""
@@ -270,8 +262,197 @@ def matches_symbols(ev, symbols, relevant_ccys):
     return True, matched
 
 
+# --------------------------------------------------------------------
+# 3b. Trade advice engine
+# --------------------------------------------------------------------
+def build_trade_advice(ev, matched_syms):
+    """
+    Pre-release analysis with buy/sell recommendation for each matched symbol.
+    Returns a dict with: scenario, headline, advice_rows, note.
+    """
+    name  = ev.get("name") or "Event"
+    ccy   = (ev.get("currency") or "").upper()
+    imp   = (ev.get("importance") or "low").lower()
+    a     = ev.get("actual")
+    f     = ev.get("forecast")
+    p     = ev.get("previous")
+    digits = int(ev.get("digits") or 2)
+
+    def num(x):
+        if x is None or x == "":
+            return None
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return None
+
+    a_f, f_f, p_f = num(a), num(f), num(p)
+
+    # Which scenario are we in?
+    if a_f is None and f_f is not None:
+        scenario = "pre"      # not released yet
+    elif a_f is not None and f_f is not None:
+        if a_f > f_f:      scenario = "beat"
+        elif a_f < f_f:    scenario = "miss"
+        else:              scenario = "inline"
+    elif a_f is not None:
+        scenario = "released"
+    else:
+        scenario = "unknown"
+
+    # Base currency = the event's currency (e.g., ZAR)
+    # For XXXCCY pairs (e.g., USDZAR), a strong ZAR → pair falls (SELL)
+    # For CCYXXX pairs (e.g., ZARJPY), a strong ZAR → pair rises (BUY)
+    def direction_for_symbol(sym, base_strength):
+        """
+        base_strength: +1 = base currency strengthens
+                       -1 = base currency weakens
+                        0 = unclear
+        """
+        parts = split_symbol(sym)
+        if len(parts) < 2:
+            return "—", "—"
+        base, quote = parts[0], parts[1]
+
+        if base_strength == 0:
+            return "NO TRADE", "flat"
+
+        # Is the event's currency the base or quote?
+        if ccy == base:
+            # CCY is base → CCY strengthens → pair UP
+            signal = "BUY" if base_strength > 0 else "SELL"
+        elif ccy == quote:
+            # CCY is quote → CCY strengthens → pair DOWN
+            signal = "SELL" if base_strength > 0 else "BUY"
+        else:
+            return "NO TRADE", "flat"
+
+        cls = "buy" if signal == "BUY" else "sell"
+        return signal, cls
+
+    # Scenario → base currency strength
+    strength_map = {
+        "beat":     +1,   # higher than forecast → base currency stronger
+        "miss":     -1,   # lower than forecast  → base currency weaker
+        "inline":    0,
+        "released":  0,
+        "pre":       0,
+        "unknown":   0,
+    }
+
+    # Pre-release: use forecast vs previous to hint at likely direction
+    hint_txt = ""
+    if scenario == "pre":
+        if f_f is not None and p_f is not None:
+            if f_f > p_f:
+                hint_txt = f"Forecast is above previous ({f_f} vs {p_f}) — mild positive bias."
+                strength_map["pre"] = +0.5
+            elif f_f < p_f:
+                hint_txt = f"Forecast is below previous ({f_f} vs {p_f}) — mild negative bias."
+                strength_map["pre"] = -0.5
+            else:
+                hint_txt = "Forecast matches previous — neutral bias."
+        else:
+            hint_txt = "Not enough data to bias direction. Wait for release."
+
+    # Confidence based on impact level
+    conf_map = {"high": "High", "medium": "Medium", "low": "Low"}
+    confidence = conf_map.get(imp, "Low")
+
+    # Build per-symbol advice rows
+    rows = []
+    for sym in matched_syms:
+        if scenario == "pre":
+            sig, cls = "WAIT", "wait"
+            reason = "Pre-release — wait for actual figure."
+        else:
+            sig, cls = direction_for_symbol(sym, strength_map.get(scenario, 0))
+            if sig == "NO TRADE":
+                reason = "In-line / unclear — stay flat."
+            else:
+                reason = "Beat → base strengthens" if scenario == "beat" else \
+                         "Miss → base weakens" if scenario == "miss" else \
+                         "In-line — no clear edge."
+        rows.append({"symbol": sym, "signal": sig, "cls": cls, "reason": reason})
+
+    # Scenario headline
+    if scenario == "pre":
+        headline = f"⏳ PRE-RELEASE — {name} ({ccy}) not yet published"
+    elif scenario == "beat":
+        headline = f"📈 BEAT — Actual {fmt_value(a, digits)} > Forecast {fmt_value(f, digits)}"
+    elif scenario == "miss":
+        headline = f"📉 MISS — Actual {fmt_value(a, digits)} < Forecast {fmt_value(f, digits)}"
+    elif scenario == "inline":
+        headline = f"➖ IN-LINE — Actual = Forecast ({fmt_value(a, digits)})"
+    else:
+        headline = "ℹ️ Released — no forecast to compare"
+
+    # Risk note based on impact
+    if imp == "high":
+        note = "⚠️ HIGH-impact event — volatility likely. Use tight stops, max 1% risk per trade."
+    elif imp == "medium":
+        note = "⚠️ MEDIUM-impact event — moderate volatility. Consider reduced position size."
+    else:
+        note = "ℹ️ LOW-impact event — moves may be small (5–20 pips). Edge is thin."
+
+    return {
+        "scenario":  scenario,
+        "headline":  headline,
+        "rows":      rows,
+        "confidence": confidence,
+        "hint":      hint_txt,
+        "note":      note,
+        "impact":    imp,
+    }
+
+
+def render_trade_advice_html(advice):
+    """Render trade advice into HTML for the card."""
+    if not advice:
+        return ""
+    html_parts = []
+    html_parts.append(f'<div class="advice-headline">{advice["headline"]}</div>')
+
+    if advice["hint"]:
+        html_parts.append(f'<div class="advice-hint">{advice["hint"]}</div>')
+
+    if advice["rows"]:
+        rows_html = ""
+        for r in advice["rows"]:
+            sig = r["signal"]
+            cls = r["cls"]
+            if sig == "BUY":
+                badge = '<span class="sig sig-buy">🟢 BUY</span>'
+            elif sig == "SELL":
+                badge = '<span class="sig sig-sell">🔴 SELL</span>'
+            elif sig == "WAIT":
+                badge = '<span class="sig sig-wait">⏳ WAIT</span>'
+            else:
+                badge = '<span class="sig sig-flat">⚪ NO TRADE</span>'
+            rows_html += (
+                f'<tr><td class="adv-sym">{escape(r["symbol"])}</td>'
+                f'<td class="adv-sig">{badge}</td>'
+                f'<td class="adv-reason">{escape(r["reason"])}</td></tr>'
+            )
+        html_parts.append(
+            '<table class="advice-table"><thead><tr>'
+            '<th>Symbol</th><th>Signal</th><th>Reason</th>'
+            '</tr></thead><tbody>' + rows_html + '</tbody></table>'
+        )
+
+    html_parts.append(
+        f'<div class="advice-confidence">Confidence: <b>{advice["confidence"]}</b></div>'
+    )
+    html_parts.append(f'<div class="advice-note">{advice["note"]}</div>')
+    html_parts.append(
+        '<div class="advice-disclaimer">⚠️ Educational analysis only. '
+        'Not financial advice. Always use proper risk management (max 1–2% per trade).</div>'
+    )
+    return "".join(html_parts)
+
+
 def build_summary(ev, symbols=None, relevant_ccys=None):
-    """Full news-style narrative paragraph."""
+    """Full news-style narrative paragraph (kept as-is)."""
     name    = ev.get("name") or "Event"
     ccy     = ev.get("currency") or ""
     country = ev.get("countryCode") or ""
@@ -308,7 +489,6 @@ def build_summary(ev, symbols=None, relevant_ccys=None):
     }.get(imp, "an economic release")
 
     parts = []
-
     sector_txt = f" in the {sector} sector" if sector else ""
     parts.append(
         f"{name} is {impact_phrase}. "
@@ -317,42 +497,29 @@ def build_summary(ev, symbols=None, relevant_ccys=None):
 
     if n(a) is not None and n(f) is not None:
         try:
-            a_f = float(a)
-            f_f = float(f)
-            diff = a_f - f_f
+            a_f = float(a); f_f = float(f); diff = a_f - f_f
             pct = (abs(diff) / abs(f_f) * 100) if f_f != 0 else 0
-
             if diff > 0:
-                verdict = (
-                    f"The actual reading came in at {n(a)}, exceeding the forecast of {n(f)} "
-                    f"by {abs(diff):.{digits}f} ({pct:.1f}%). This stronger-than-expected result "
-                    f"is generally bullish for {ccy}."
-                )
+                verdict = (f"The actual reading came in at {n(a)}, exceeding the forecast of {n(f)} "
+                           f"by {abs(diff):.{digits}f} ({pct:.1f}%). This stronger-than-expected result "
+                           f"is generally bullish for {ccy}.")
             elif diff < 0:
-                verdict = (
-                    f"The actual reading came in at {n(a)}, falling short of the forecast of {n(f)} "
-                    f"by {abs(diff):.{digits}f} ({pct:.1f}%). This weaker-than-expected result "
-                    f"is generally bearish for {ccy}."
-                )
+                verdict = (f"The actual reading came in at {n(a)}, falling short of the forecast of {n(f)} "
+                           f"by {abs(diff):.{digits}f} ({pct:.1f}%). This weaker-than-expected result "
+                           f"is generally bearish for {ccy}.")
             else:
-                verdict = (
-                    f"The actual reading of {n(a)} matched the forecast exactly. "
-                    f"Markets are unlikely to react strongly to this release."
-                )
+                verdict = (f"The actual reading of {n(a)} matched the forecast exactly. "
+                           f"Markets are unlikely to react strongly to this release.")
             parts.append(verdict)
         except (TypeError, ValueError):
             parts.append(f"Actual: {n(a)}, Forecast: {n(f)}, Previous: {n(p)}.")
     elif n(a) is not None:
         parts.append(f"The actual reading was released at {n(a)}.")
     elif n(f) is not None:
-        parts.append(
-            f"The event is scheduled for release. Analysts forecast a reading of {n(f)}. "
-            f"Markets will watch closely for the actual figure."
-        )
+        parts.append(f"The event is scheduled for release. Analysts forecast a reading of {n(f)}. "
+                     f"Markets will watch closely for the actual figure.")
     else:
-        parts.append(
-            "The event has been scheduled but no forecast or actual values are available yet."
-        )
+        parts.append("The event has been scheduled but no forecast or actual values are available yet.")
 
     if n(p) is not None:
         prev_txt = f"The previous reading was {n(p)}"
@@ -364,24 +531,15 @@ def build_summary(ev, symbols=None, relevant_ccys=None):
     if symbols and relevant_ccys:
         is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
         if is_rel:
-            parts.append(
-                f"⚠️ This event directly affects your connected symbols: {', '.join(matched)}."
-            )
+            parts.append(f"⚠️ This event directly affects your connected symbols: {', '.join(matched)}.")
         else:
-            parts.append(
-                f"ℹ️ This event does not directly affect your connected symbols "
-                f"({', '.join(symbols)})."
-            )
+            parts.append(f"ℹ️ This event does not directly affect your connected symbols ({', '.join(symbols)}).")
 
     if imp == "high":
-        parts.append(
-            "Traders should be prepared for increased volatility around the release time. "
-            "Use appropriate risk management and consider spread widening on affected pairs."
-        )
+        parts.append("Traders should be prepared for increased volatility around the release time. "
+                     "Use appropriate risk management and consider spread widening on affected pairs.")
     elif imp == "medium":
-        parts.append(
-            "Traders may want to monitor the release for potential short-term opportunities."
-        )
+        parts.append("Traders may want to monitor the release for potential short-term opportunities.")
 
     return " ".join(parts)
 
@@ -445,6 +603,12 @@ def build_payload(news, symbols, relevant_ccys):
 
         is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
 
+        # Trade advice only for relevant events
+        advice_html = ""
+        if is_rel and matched:
+            advice = build_trade_advice(ev, matched)
+            advice_html = render_trade_advice_html(advice)
+
         out.append({
             "name":        ev.get("name") or "—",
             "currency":    ev.get("currency") or "—",
@@ -474,6 +638,7 @@ def build_payload(news, symbols, relevant_ccys):
             "text":        text,
             "relevant":    is_rel,
             "matchedSyms": matched,
+            "adviceHtml":  advice_html,
         })
     return out
 
@@ -502,9 +667,7 @@ def generate_html(news, output="news_report.html"):
     highs   = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
     lows    = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
-    relevant_count = sum(
-        1 for e in news if matches_symbols(e, symbols, relevant_ccys)[0]
-    )
+    relevant_count = sum(1 for e in news if matches_symbols(e, symbols, relevant_ccys)[0])
 
     currencies = sorted({str(e.get("currency", "")) for e in news if e.get("currency")})
     ccy_options = "".join(f'<option value="{c}">{c}</option>' for c in currencies)
@@ -521,20 +684,16 @@ def generate_html(news, output="news_report.html"):
   :root {{
     --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0;
     --muted: #94a3b8; --accent: #38bdf8; --border: #334155;
+    --buy: #4ade80; --sell: #f87171; --wait: #fbbf24;
   }}
   * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding: 24px;
-  }}
-  header {{
-    display: flex; justify-content: space-between; align-items: center;
-    flex-wrap: wrap; gap: 12px; margin-bottom: 20px;
-  }}
+  body {{ margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 24px; }}
+  header {{ display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }}
   h1 {{ font-size: 22px; margin: 0; }}
   .meta {{ color: var(--muted); font-size: 13px; }}
 
-  /* ⏱ Next-news countdown banner */
   .next-banner {{
     background: linear-gradient(135deg, #0b1220 0%, #162033 100%);
     border: 1px solid var(--border); border-left: 4px solid var(--accent);
@@ -542,25 +701,17 @@ def generate_html(news, output="news_report.html"):
     display: flex; justify-content: space-between; align-items: center;
     flex-wrap: wrap; gap: 14px;
   }}
-  .next-banner.empty {{
-    border-left-color: #64748b; opacity: .8;
-  }}
+  .next-banner.empty {{ border-left-color: #64748b; opacity: .8; }}
   .next-banner .left {{ display: flex; flex-direction: column; gap: 4px; }}
-  .next-banner .lbl {{
-    color: var(--accent); font-size: 11px; font-weight: 700;
-    letter-spacing: .06em; text-transform: uppercase;
-  }}
+  .next-banner .lbl {{ color: var(--accent); font-size: 11px; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase; }}
   .next-banner.empty .lbl {{ color: var(--muted); }}
   .next-banner .name {{ font-size: 16px; font-weight: 600; }}
   .next-banner .sub {{ color: var(--muted); font-size: 12px; }}
-  .countdown {{
-    font-family: "SF Mono", Consolas, monospace;
-    font-size: 26px; font-weight: 700; color: var(--accent);
-    letter-spacing: .05em; white-space: nowrap;
-  }}
-  .countdown .unit {{ font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 2px; }}
-  .countdown.soon {{ color: #fbbf24; animation: blink 1s ease-in-out infinite; }}
-  .countdown.live {{ color: #4ade80; }}
+  .countdown {{ font-family: "SF Mono", Consolas, monospace; font-size: 26px;
+    font-weight: 700; color: var(--accent); letter-spacing: .05em; white-space: nowrap; }}
+  .countdown.soon {{ color: var(--wait); animation: blink 1s ease-in-out infinite; }}
+  .countdown.live {{ color: var(--buy); }}
   .countdown.past {{ color: var(--muted); }}
   @keyframes blink {{ 50% {{ opacity: .5; }} }}
 
@@ -575,32 +726,24 @@ def generate_html(news, output="news_report.html"):
     padding: 2px 8px; border-radius: 4px; font-size: 12px; color: var(--accent);
   }}
   .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }}
-  .stat {{
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px 16px; min-width: 90px;
-  }}
+  .stat {{ background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 16px; min-width: 90px; }}
   .stat .num {{ font-size: 22px; font-weight: 700; }}
   .stat .lbl {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }}
   .stat.high .num {{ color: #e53935; }}
   .stat.medium .num {{ color: #fb8c00; }}
   .stat.low .num {{ color: #43a047; }}
-  .stat.rel .num {{ color: #38bdf8; }}
+  .stat.rel .num {{ color: var(--accent); }}
   .controls {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }}
-  input, select {{
-    background: var(--panel); border: 1px solid var(--border);
-    color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px;
-  }}
+  input, select {{ background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }}
   input:focus, select:focus {{ outline: none; border-color: var(--accent); }}
-  .chk-label {{
-    display: inline-flex; align-items: center; gap: 6px;
+  .chk-label {{ display: inline-flex; align-items: center; gap: 6px;
     background: var(--panel); border: 1px solid var(--border);
-    padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
-  }}
+    padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }}
   .chk-label input {{ margin: 0; cursor: pointer; }}
-  table {{
-    width: 100%; border-collapse: collapse; background: var(--panel);
-    border-radius: 10px; overflow: hidden; font-size: 13px;
-  }}
+  table {{ width: 100%; border-collapse: collapse; background: var(--panel);
+    border-radius: 10px; overflow: hidden; font-size: 13px; }}
   thead {{ background: #0b1220; position: sticky; top: 0; }}
   th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
   th {{ color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
@@ -608,133 +751,124 @@ def generate_html(news, output="news_report.html"):
   tbody tr:hover td {{ background: rgba(56,189,248,.08); }}
   .name {{ font-weight: 500; }}
   .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .num.beat {{ color: #4ade80; font-weight: 600; }}
-  .num.miss {{ color: #f87171; font-weight: 600; }}
+  .num.beat {{ color: var(--buy); font-weight: 600; }}
+  .num.miss {{ color: var(--sell); font-weight: 600; }}
   .rel-time {{ font-family: "SF Mono", Consolas, monospace; font-size: 12px; color: var(--muted); white-space: nowrap; }}
-  .rel-time.soon {{ color: #fbbf24; font-weight: 600; }}
-  .rel-time.live {{ color: #4ade80; font-weight: 600; }}
-  .ccy {{
-    display: inline-block; background: #0b1220; border: 1px solid var(--border);
-    padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;
-  }}
-  .badge {{
-    display: inline-block; padding: 2px 8px; border-radius: 999px;
-    font-size: 11px; font-weight: 700; letter-spacing: .04em;
-  }}
+  .rel-time.soon {{ color: var(--wait); font-weight: 600; }}
+  .rel-time.live {{ color: var(--buy); font-weight: 600; }}
+  .ccy {{ display: inline-block; background: #0b1220; border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; letter-spacing: .04em; }}
   .xcol {{ text-align: center; width: 40px; }}
   .xmark {{ font-size: 16px; display: inline-block; line-height: 1; }}
   .xmark.yes {{ filter: drop-shadow(0 0 4px rgba(74,222,128,.5)); }}
   .xmark.no  {{ opacity: .55; }}
   footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; }}
 
-  /* Next-event row pulse */
-  tbody tr.is-next td {{
-    background: rgba(56,189,248,.10);
-  }}
+  tbody tr.is-next td {{ background: rgba(56,189,248,.10); }}
   tbody tr.is-next td:last-child::after {{
-    content: "⏱ NEXT";
-    display: inline-block; margin-left: 8px;
+    content: "⏱ NEXT"; display: inline-block; margin-left: 8px;
     font-size: 10px; font-weight: 700; letter-spacing: .06em;
     color: #0b1220; background: var(--accent);
     padding: 2px 6px; border-radius: 4px;
   }}
 
-  /* Neon highlights */
-  tbody tr.neon td {{
-    background: rgba(56, 189, 248, 0.06);
-    border-bottom-color: rgba(56, 189, 248, 0.25);
-  }}
+  tbody tr.neon td {{ background: rgba(56, 189, 248, 0.06);
+    border-bottom-color: rgba(56, 189, 248, 0.25); }}
   tbody tr.neon td:first-child {{
     box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9);
-    animation: neonPulse 2.2s ease-in-out infinite;
-  }}
+    animation: neonPulse 2.2s ease-in-out infinite; }}
   tbody tr.neon:hover td {{ background: rgba(56, 189, 248, 0.12); }}
   @keyframes neonPulse {{
     0%, 100% {{ box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9); }}
     50%      {{ box-shadow: inset 3px 0 0 0 #7dd3fc, inset 6px 0 26px -6px rgba(125,211,252,1); }}
   }}
-  tbody tr.neon.gold td {{
-    background: rgba(251, 191, 36, 0.07);
-    border-bottom-color: rgba(251, 191, 36, 0.25);
-  }}
+  tbody tr.neon.gold td {{ background: rgba(251, 191, 36, 0.07);
+    border-bottom-color: rgba(251, 191, 36, 0.25); }}
   tbody tr.neon.gold td:first-child {{
     box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9);
-    animation: neonPulseGold 2.2s ease-in-out infinite;
-  }}
+    animation: neonPulseGold 2.2s ease-in-out infinite; }}
   tbody tr.neon.gold:hover td {{ background: rgba(251, 191, 36, 0.13); }}
   @keyframes neonPulseGold {{
     0%, 100% {{ box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9); }}
     50%      {{ box-shadow: inset 3px 0 0 0 #fde68a, inset 6px 0 26px -6px rgba(253,230,138,1); }}
   }}
 
-  /* ---------- Modal / Card ---------- */
-  .backdrop {{
-    position: fixed; inset: 0; background: rgba(2,6,23,.75);
-    backdrop-filter: blur(4px);
-    display: none; align-items: center; justify-content: center;
-    padding: 20px; z-index: 1000;
-  }}
+  .backdrop {{ position: fixed; inset: 0; background: rgba(2,6,23,.75);
+    backdrop-filter: blur(4px); display: none; align-items: center;
+    justify-content: center; padding: 20px; z-index: 1000; }}
   .backdrop.open {{ display: flex; }}
-  .card {{
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 14px; max-width: 720px; width: 100%;
-    max-height: 90vh; overflow-y: auto;
-    box-shadow: 0 25px 60px rgba(0,0,0,.6);
-    animation: pop .18s ease-out;
-  }}
+  .card {{ background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; max-width: 760px; width: 100%; max-height: 90vh;
+    overflow-y: auto; box-shadow: 0 25px 60px rgba(0,0,0,.6);
+    animation: pop .18s ease-out; }}
   @keyframes pop {{
     from {{ transform: translateY(12px) scale(.98); opacity: 0; }}
     to   {{ transform: translateY(0) scale(1); opacity: 1; }}
   }}
-  .card-head {{
-    padding: 18px 22px; border-bottom: 1px solid var(--border);
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
-  }}
+  .card-head {{ padding: 18px 22px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }}
   .card-head h2 {{ margin: 0; font-size: 18px; }}
   .card-head .sub {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
-  .close {{
-    background: transparent; border: 1px solid var(--border); color: var(--muted);
-    border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 14px;
-  }}
+  .close {{ background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 14px; }}
   .close:hover {{ color: var(--text); border-color: var(--accent); }}
   .card-body {{ padding: 18px 22px 22px; }}
 
-  .rel-banner {{
-    padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
-    font-size: 13px; font-weight: 600;
-  }}
+  .rel-banner {{ padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+    font-size: 13px; font-weight: 600; }}
   .rel-banner.yes {{ background: rgba(74,222,128,.1); border: 1px solid rgba(74,222,128,.4); color: #86efac; }}
   .rel-banner.no  {{ background: rgba(148,163,184,.1); border: 1px solid rgba(148,163,184,.3); color: var(--muted); }}
 
-  .grid {{
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 10px; margin-bottom: 16px;
-  }}
-  .field {{
-    background: #0b1220; border: 1px solid var(--border);
-    border-radius: 8px; padding: 8px 10px;
-  }}
-  .field .k {{ color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin-bottom: 16px; }}
+  .field {{ background: #0b1220; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; }}
+  .field .k {{ color: var(--muted); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .05em; margin-bottom: 3px; }}
   .field .v {{ font-size: 14px; font-weight: 600; word-break: break-word; }}
   .field .v.big {{ font-size: 18px; }}
-  .field .v.beat {{ color: #4ade80; }}
-  .field .v.miss {{ color: #f87171; }}
+  .field .v.beat {{ color: var(--buy); }}
+  .field .v.miss {{ color: var(--sell); }}
 
-  .news-text {{
-    background: linear-gradient(135deg, #0b1220 0%, #162033 100%);
+  .news-text {{ background: linear-gradient(135deg, #0b1220 0%, #162033 100%);
     border: 1px solid var(--border); border-left: 3px solid var(--accent);
-    border-radius: 10px; padding: 14px 16px; margin-top: 6px;
-  }}
-  .news-text .lbl {{
-    color: var(--accent); font-size: 11px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px;
-  }}
+    border-radius: 10px; padding: 14px 16px; margin-top: 6px; }}
+  .news-text .lbl {{ color: var(--accent); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }}
   .news-text .body {{ line-height: 1.7; font-size: 14px; color: #cbd5e1; }}
 
-  .src-link {{
-    display: inline-block; margin-top: 14px; color: var(--accent);
-    font-size: 13px; text-decoration: none; border-bottom: 1px dashed var(--accent);
-  }}
+  /* Trade advice */
+  .advice {{ margin-top: 14px; background: linear-gradient(135deg, #0b1220 0%, #1a2739 100%);
+    border: 1px solid var(--border); border-left: 3px solid var(--wait);
+    border-radius: 10px; padding: 14px 16px; }}
+  .advice .lbl {{ color: var(--wait); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }}
+  .advice-headline {{ font-size: 15px; font-weight: 700; margin-bottom: 8px; color: #fde68a; }}
+  .advice-hint {{ font-size: 13px; color: #cbd5e1; margin-bottom: 10px; font-style: italic; }}
+  .advice-table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px;
+    font-size: 13px; background: #0b1220; border-radius: 8px; overflow: hidden; }}
+  .advice-table th, .advice-table td {{ padding: 8px 10px; text-align: left;
+    border-bottom: 1px solid var(--border); }}
+  .advice-table th {{ color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .05em; }}
+  .adv-sym {{ font-weight: 700; color: var(--accent); }}
+  .sig {{ font-weight: 700; padding: 2px 8px; border-radius: 6px; font-size: 12px; }}
+  .sig-buy  {{ background: rgba(74,222,128,.15); color: var(--buy); }}
+  .sig-sell {{ background: rgba(248,113,113,.15); color: var(--sell); }}
+  .sig-wait {{ background: rgba(251,191,36,.15); color: var(--wait); }}
+  .sig-flat {{ background: rgba(148,163,184,.15); color: var(--muted); }}
+  .adv-reason {{ color: var(--muted); font-size: 12px; }}
+  .advice-confidence {{ font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }}
+  .advice-note {{ font-size: 12px; color: #cbd5e1; margin-bottom: 8px;
+    padding: 8px 10px; background: rgba(251,191,36,.08);
+    border-left: 2px solid var(--wait); border-radius: 4px; }}
+  .advice-disclaimer {{ font-size: 11px; color: var(--muted); font-style: italic;
+    padding-top: 6px; border-top: 1px dashed var(--border); }}
+
+  .src-link {{ display: inline-block; margin-top: 14px; color: var(--accent);
+    font-size: 13px; text-decoration: none; border-bottom: 1px dashed var(--accent); }}
   .src-link:hover {{ opacity: .8; }}
 
   @media (max-width: 720px) {{
@@ -752,7 +886,6 @@ def generate_html(news, output="news_report.html"):
     <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events today &nbsp;•&nbsp; Click any row for details</div>
   </header>
 
-  <!-- ⏱ Next news countdown -->
   <div class="next-banner" id="nextBanner">
     <div class="left">
       <div class="lbl">⏱ Next event</div>
@@ -806,7 +939,7 @@ def generate_html(news, output="news_report.html"):
   <table id="newsTable">
     <thead>
       <tr>
-        <th class="xcol" title="Relevance to your connected symbols">X</th>
+        <th class="xcol" title="Relevance">X</th>
         <th>Time (Tehran)</th>
         <th>From now</th>
         <th>CCY</th><th>Impact</th><th>Event</th>
@@ -823,7 +956,6 @@ def generate_html(news, output="news_report.html"):
 
   <footer>Generated locally • No API credits used • All times shown in Tehran (UTC+3:30)</footer>
 
-  <!-- 🔔 News detail card -->
   <div class="backdrop" id="backdrop" onclick="if(event.target===this) closeCard()">
     <div class="card" id="card">
       <div class="card-head">
@@ -842,6 +974,11 @@ def generate_html(news, output="news_report.html"):
           <div class="body" id="c-text">—</div>
         </div>
 
+        <div class="advice" id="c-advice" style="display:none">
+          <div class="lbl">💹 Trade Analysis</div>
+          <div id="c-advice-body"></div>
+        </div>
+
         <a id="c-source" class="src-link" href="#" target="_blank" rel="noopener">🔗 Official source</a>
       </div>
     </div>
@@ -850,7 +987,6 @@ def generate_html(news, output="news_report.html"):
 <script>
 const NEWS = {payload_json};
 
-/* ---------- Relative time / countdown helpers ---------- */
 function humanDelta(ms) {{
   const past = ms < 0;
   let s = Math.abs(Math.floor(ms / 1000));
@@ -875,11 +1011,8 @@ function shortDelta(ms) {{
   return (past ? '−' : '') + s + 's';
 }}
 
-/* ---------- Refresh every second ---------- */
 function tick() {{
   const now = Date.now();
-
-  /* Update each row's "From now" column */
   document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
     const cell = tr.querySelector('.rel-time');
     if (!cell) return;
@@ -889,17 +1022,14 @@ function tick() {{
     const delta = t - now;
     cell.textContent = humanDelta(delta);
     cell.classList.toggle('live', Math.abs(delta) < 60000);
-    cell.classList.toggle('soon', delta > 0 && delta < 900000); /* <15min */
+    cell.classList.toggle('soon', delta > 0 && delta < 900000);
   }});
 
-  /* Find the next upcoming event */
   let next = null;
   NEWS.forEach(n => {{
     if (!n.timeIso) return;
     const t = new Date(n.timeIso).getTime();
-    if (t > now && (!next || t < new Date(next.timeIso).getTime())) {{
-      next = n;
-    }}
+    if (t > now && (!next || t < new Date(next.timeIso).getTime())) next = n;
   }});
 
   const banner = document.getElementById('nextBanner');
@@ -907,25 +1037,20 @@ function tick() {{
   const subEl  = document.getElementById('nextSub');
   const cdEl   = document.getElementById('countdown');
 
-  /* Clear previous NEXT marker */
   document.querySelectorAll('tr.is-next').forEach(r => r.classList.remove('is-next'));
 
   if (next) {{
     banner.classList.remove('empty');
     nameEl.textContent = next.name;
     const matched = next.matchedSyms && next.matchedSyms.length
-      ? ' · affects ' + next.matchedSyms.join(', ')
-      : '';
+      ? ' · affects ' + next.matchedSyms.join(', ') : '';
     subEl.textContent = next.timeTehran + ' · ' + next.currency + ' · ' +
                         next.importance.toUpperCase() + matched;
-
     const delta = new Date(next.timeIso).getTime() - now;
     cdEl.textContent = shortDelta(delta);
     cdEl.classList.toggle('soon', delta < 900000 && delta > 0);
     cdEl.classList.toggle('live', Math.abs(delta) < 60000);
     cdEl.classList.remove('past');
-
-    /* Mark the row */
     const idx = NEWS.indexOf(next);
     const row = document.querySelector(`tr[data-idx="${{idx}}"]`);
     if (row) row.classList.add('is-next');
@@ -941,7 +1066,6 @@ function tick() {{
 setInterval(tick, 1000);
 tick();
 
-/* ---------- Modal ---------- */
 function field(k, v, cls="") {{
   return `<div class="field"><div class="k">${{k}}</div><div class="v ${{cls}}">${{v}}</div></div>`;
 }}
@@ -998,6 +1122,17 @@ function openCard(idx) {{
   document.getElementById('c-grid').innerHTML = grid;
   document.getElementById('c-text').textContent = n.text;
 
+  // Trade advice block
+  const advWrap = document.getElementById('c-advice');
+  const advBody = document.getElementById('c-advice-body');
+  if (n.adviceHtml) {{
+    advWrap.style.display = 'block';
+    advBody.innerHTML = n.adviceHtml;
+  }} else {{
+    advWrap.style.display = 'none';
+    advBody.innerHTML = '';
+  }}
+
   const link = document.getElementById('c-source');
   if (n.sourceUrl) {{
     link.href = n.sourceUrl;
@@ -1019,7 +1154,6 @@ document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
   tr.addEventListener('click', () => openCard(parseInt(tr.dataset.idx, 10)));
 }});
 
-/* ---------- Filtering ---------- */
 function filterRows() {{
   const q    = document.getElementById('search').value.toLowerCase();
   const imp  = document.getElementById('impFilter').value;
@@ -1057,7 +1191,6 @@ filterRows();
 # Main
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    # today_only=True → only today's events (Tehran date)
     news = load_news(today_only=True)
     if not news:
         print("[!] Nothing to export.")
