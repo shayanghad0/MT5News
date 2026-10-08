@@ -48,8 +48,12 @@ pip install MetaTrader5
 ### 2. Run the script
 
 ```powershell
-cd C:\Users\Shayan\Desktop\YTStrategy
-py news_to_html.py
+git clone https://github.com/shayanghad0/MT5News
+cd MT5News
+pip install biquote MetaTrader5
+## if not working 
+py -m pip install biquote MetaTrader5
+py main.py
 ```
 
 ### 3. Open the outputs
