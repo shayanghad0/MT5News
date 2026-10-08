@@ -1,10 +1,16 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from html import escape
 
 # --------------------------------------------------------------------
-# 1. Free live fetch via biquote — fetches ALL events now
+# Tehran timezone (Iran Standard Time, UTC+3:30 — no DST since 2022)
+# --------------------------------------------------------------------
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
+
+
+# --------------------------------------------------------------------
+# 1. Free live fetch via biquote — fetches ALL events
 #    pip install biquote
 # --------------------------------------------------------------------
 def _get(obj, *names, default=None):
@@ -27,7 +33,7 @@ def fetch_free_news():
         events = bq.calendar()
 
         # If your biquote version requires a date range, uncomment below:
-        # from datetime import date, timedelta
+        # from datetime import date
         # today = date.today()
         # events = bq.calendar(from_date=today, to_date=today + timedelta(days=7))
 
@@ -75,7 +81,6 @@ def fetch_free_news():
 LOCAL_NEWS = []
 
 def load_news():
-    # Priority 1: your exported MQL5 data
     if os.path.exists("news.json"):
         try:
             with open("news.json", "r", encoding="utf-8") as f:
@@ -86,13 +91,11 @@ def load_news():
         except Exception as ex:
             print(f"[!] news.json parse error: {ex}")
 
-    # Priority 2: free live fetch (ALL news)
     data = fetch_free_news()
     if data:
         print(f"[✓] Using {len(data)} events from biquote (ALL importance).")
         return data
 
-    # Priority 3: inline list
     if LOCAL_NEWS:
         print(f"[✓] Using {len(LOCAL_NEWS)} inline events.")
         return LOCAL_NEWS
@@ -112,6 +115,22 @@ IMPORTANCE_COLORS = {
     "speech": ("#0288d1", "#e1f5fe"),
 }
 
+def to_tehran(iso_str):
+    """Convert an ISO timestamp (any tz) to Tehran time and format."""
+    if not iso_str:
+        return ""
+    s = str(iso_str).strip()
+    try:
+        # Handle trailing 'Z'
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        # If naive, assume UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_tehran = dt.astimezone(TEHRAN_TZ)
+        return dt_tehran.strftime("%Y-%m-%d %H:%M")   # header already says Tehran
+    except Exception:
+        return s
+
 def fmt_value(v, digits=2):
     if v is None or v == "":
         return "—"
@@ -124,13 +143,7 @@ def build_row(ev):
     imp = (ev.get("importance") or "low").lower()
     color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
 
-    t = ev.get("time") or ""
-    if t:
-        try:
-            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
-            t = dt.strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            pass
+    t = to_tehran(ev.get("time"))   # ✅ Tehran time
 
     digits = ev.get("digits") or 2
     actual   = fmt_value(ev.get("actual"),   digits)
@@ -159,23 +172,24 @@ def build_row(ev):
 
 
 def generate_html(news, output="news_report.html"):
-    # Sort by time ascending
     def sort_key(e):
         t = e.get("time") or ""
         try:
-            return datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except Exception:
-            return datetime.max
+            return datetime.max.replace(tzinfo=timezone.utc)
 
     news = sorted(news, key=sort_key)
     rows = "\n".join(build_row(e) for e in news)
-    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    generated_at = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M Tehran")
     total = len(news)
 
-    # Stats
-    highs = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
+    highs   = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
-    lows = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
+    lows    = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
 
     currencies = sorted({str(e.get("currency","")) for e in news if e.get("currency")})
     ccy_options = "".join(f'<option value="{c}">{c}</option>' for c in currencies)
@@ -201,9 +215,7 @@ def generate_html(news, output="news_report.html"):
   }}
   h1 {{ font-size: 22px; margin: 0; }}
   .meta {{ color: var(--muted); font-size: 13px; }}
-  .stats {{
-    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px;
-  }}
+  .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }}
   .stat {{
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; padding: 10px 16px; min-width: 90px;
@@ -280,7 +292,7 @@ def generate_html(news, output="news_report.html"):
   <table id="newsTable">
     <thead>
       <tr>
-        <th>Time (UTC)</th><th>CCY</th><th>Impact</th><th>Event</th>
+        <th>Time (Tehran)</th><th>CCY</th><th>Impact</th><th>Event</th>
         <th style="text-align:right">Actual</th>
         <th style="text-align:right">Forecast</th>
         <th style="text-align:right">Previous</th>
@@ -292,7 +304,7 @@ def generate_html(news, output="news_report.html"):
     </tbody>
   </table>
 
-  <footer>Generated locally • No API credits used</footer>
+  <footer>Generated locally • No API credits used • Times shown in Tehran (UTC+3:30)</footer>
 
 <script>
 function filterRows() {{
@@ -319,6 +331,7 @@ filterRows();
         f.write(html)
     print(f"[✓] HTML report written → {os.path.abspath(output)}")
     print(f"[i] Breakdown — High: {highs} | Medium: {mediums} | Low: {lows} | Total: {total}")
+    print(f"[i] Times shown in Tehran time (UTC+3:30)")
 
 
 if __name__ == "__main__":
