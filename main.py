@@ -23,6 +23,7 @@ def _get(obj, *names, default=None):
                 return v
     return default
 
+
 def fetch_free_news():
     try:
         from biquote import Biquote
@@ -58,7 +59,6 @@ def fetch_free_news():
                 'revision':       _get(e, 'revision', default=0),
                 'timeMode':       _get(e, 'timeMode', default='exact'),
                 'sourceUrl':      _get(e, 'sourceUrl', 'url', default=''),
-                # 📰 optional news text — may be missing
                 'description':    _get(e, 'description', 'text', 'news_text', 'details', 'summary'),
                 'source':         'biquote',
             })
@@ -72,6 +72,7 @@ def fetch_free_news():
 # 2. Data loading
 # --------------------------------------------------------------------
 LOCAL_NEWS = []
+
 
 def load_news():
     if os.path.exists("news.json"):
@@ -101,12 +102,13 @@ def load_news():
 # 3. Helpers
 # --------------------------------------------------------------------
 IMPORTANCE_COLORS = {
-    "high":   ("#e53935", "#ffebee"),
-    "medium": ("#fb8c00", "#fff3e0"),
-    "low":    ("#43a047", "#e8f5e9"),
-    "holiday":("#7e57c2", "#ede7f6"),
-    "speech": ("#0288d1", "#e1f5fe"),
+    "high":    ("#e53935", "#ffebee"),
+    "medium":  ("#fb8c00", "#fff3e0"),
+    "low":     ("#43a047", "#e8f5e9"),
+    "holiday": ("#7e57c2", "#ede7f6"),
+    "speech":  ("#0288d1", "#e1f5fe"),
 }
+
 
 def to_tehran(iso_str):
     if not iso_str:
@@ -120,6 +122,7 @@ def to_tehran(iso_str):
     except Exception:
         return s
 
+
 def to_utc(iso_str):
     if not iso_str:
         return ""
@@ -132,6 +135,7 @@ def to_utc(iso_str):
     except Exception:
         return s
 
+
 def fmt_value(v, digits=2):
     if v is None or v == "":
         return "—"
@@ -140,54 +144,49 @@ def fmt_value(v, digits=2):
     except (ValueError, TypeError):
         return escape(str(v))
 
+
 def build_summary(ev):
-    """Generate readable news text when no description exists."""
+    """Short, headline-style summary. Does NOT repeat grid values."""
     name = ev.get("name") or "Event"
     ccy  = ev.get("currency") or ""
     imp  = (ev.get("importance") or "").lower()
     a = ev.get("actual")
     f = ev.get("forecast")
-    p = ev.get("previous")
-    digits = ev.get("digits") or 2
-    unit = ev.get("unit") or "none"
-    mult = ev.get("multiplier") or "none"
+    digits = int(ev.get("digits") or 2)
 
     def n(x):
         if x is None or x == "":
             return None
         try:
-            return f"{float(x):.{int(digits)}f}"
+            return f"{float(x):.{digits}f}"
         except (ValueError, TypeError):
             return str(x)
 
-    unit_txt = "" if unit in ("none", "", None) else f" ({unit}{', ' + mult if mult not in ('none','',None) else ''})"
+    # No numbers at all yet
+    if n(a) is None and n(f) is None:
+        return f"⏳ Awaiting release for {ccy}. No forecast available."
 
-    parts = []
-    parts.append(f"{name}{unit_txt} — {ccy} {imp.upper()}-impact event.")
+    # Scheduled but not released
+    if n(a) is None and n(f) is not None:
+        return f"⏳ Scheduled release for {ccy}. Market expects {n(f)}. Awaiting publication."
 
-    if n(a) is not None and n(f) is not None:
-        try:
-            diff = float(a) - float(f)
-            direction = "beat" if diff > 0 else ("missed" if diff < 0 else "matched")
-            parts.append(
-                f"Actual came in at {n(a)}, {direction} the forecast of {n(f)} "
-                f"(previous: {n(p) if n(p) is not None else 'N/A'})."
-            )
-        except (TypeError, ValueError):
-            parts.append(f"Actual: {n(a)}, Forecast: {n(f)}, Previous: {n(p)}.")
-    elif n(a) is not None:
-        parts.append(f"Actual released at {n(a)} (forecast: {n(f) or 'N/A'}, previous: {n(p) or 'N/A'}).")
-    elif n(f) is not None:
-        parts.append(f"Scheduled release. Forecast: {n(f)}, Previous: {n(p) if n(p) is not None else 'N/A'}.")
-    else:
-        parts.append("Awaiting release. No numeric values published yet.")
-
-    if imp == "high":
-        parts.append("Considered a high-volatility event — markets may react sharply.")
-    elif imp == "medium":
-        parts.append("Moderate impact expected on related currency pairs.")
-
-    return " ".join(parts)
+    # Numbers available → one-line verdict
+    try:
+        a_f = float(a)
+        f_f = float(f) if f is not None else None
+        if f_f is not None:
+            diff = a_f - f_f
+            if diff > 0:
+                verdict = f"📈 Beat forecast by {abs(diff):.{digits}f}"
+            elif diff < 0:
+                verdict = f"📉 Missed forecast by {abs(diff):.{digits}f}"
+            else:
+                verdict = "➖ Matched forecast exactly"
+            return f"{verdict} — {name} ({ccy}, {imp.upper()} impact)."
+        else:
+            return f"✅ Released at {n(a)} — {name} ({ccy}, {imp.upper()} impact)."
+    except (TypeError, ValueError):
+        return f"Released: {n(a)} — {name} ({ccy}, {imp.upper()} impact)."
 
 
 # --------------------------------------------------------------------
@@ -225,7 +224,6 @@ def build_row(ev, idx):
 
 
 def build_payload(news):
-    """Prepare JSON-safe payload for the modal."""
     out = []
     for ev in news:
         imp = (ev.get("importance") or "low").lower()
@@ -288,7 +286,7 @@ def generate_html(news, output="news_report.html"):
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
     lows    = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
 
-    currencies = sorted({str(e.get("currency","")) for e in news if e.get("currency")})
+    currencies = sorted({str(e.get("currency", "")) for e in news if e.get("currency")})
     ccy_options = "".join(f'<option value="{c}">{c}</option>' for c in currencies)
 
     html = f"""<!DOCTYPE html>
@@ -509,7 +507,6 @@ function openCard(idx) {{
   document.getElementById('c-sub').innerHTML =
     `<span class="ccy">${{n.currency}}</span> &nbsp;•&nbsp; ${{n.country}} &nbsp;•&nbsp; ${{n.importance.toUpperCase()}} impact &nbsp;•&nbsp; ${{n.type}}`;
 
-  // Actual / Forecast / Previous with beat/miss coloring
   let aCls = "";
   const a = parseFloat(n.actual), f = parseFloat(n.forecast);
   if (!isNaN(a) && !isNaN(f)) aCls = a > f ? "beat" : (a < f ? "miss" : "");
@@ -588,6 +585,9 @@ filterRows();
     print(f"[i] Times shown in Tehran time (UTC+3:30)")
 
 
+# --------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------
 if __name__ == "__main__":
     news = load_news()
     if not news:
