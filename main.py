@@ -17,6 +17,20 @@ KNOWN_CCY = [
     "CZK", "MXN", "ZAR", "SGD", "HKD", "RUB", "INR", "BRL",
 ]
 
+# --------------------------------------------------------------------
+# Inverse indicators — higher value is BAD for the currency
+# (e.g., more jobless claims = weaker economy = weaker currency)
+# --------------------------------------------------------------------
+INVERSE_KEYWORDS = [
+    "jobless", "unemployment", "claims", "layoff", "layoffs",
+    "dismissal", "bankrupt", "bankruptcy", "default",
+    "inventories", "stockpiles",     # rising inventories often bearish
+]
+
+def is_inverse_indicator(name):
+    n = (name or "").lower()
+    return any(kw in n for kw in INVERSE_KEYWORDS)
+
 
 def get_connected_symbols():
     try:
@@ -251,7 +265,7 @@ def matches_symbols(ev, symbols, relevant_ccys):
 
 
 # --------------------------------------------------------------------
-# 3b. Trade advice engine — NO WAIT / NO TRADE rows
+# 3b. Trade advice engine — inverse-aware, no WAIT/NO TRADE rows
 # --------------------------------------------------------------------
 def build_trade_advice(ev, matched_syms):
     name  = ev.get("name") or "Event"
@@ -261,6 +275,8 @@ def build_trade_advice(ev, matched_syms):
     f     = ev.get("forecast")
     p     = ev.get("previous")
     digits = int(ev.get("digits") or 2)
+
+    inverse = is_inverse_indicator(name)
 
     def num(x):
         if x is None or x == "":
@@ -302,38 +318,55 @@ def build_trade_advice(ev, matched_syms):
     strength = 0
     reason_prefix = ""
     headline = ""
+    tag = " [inverse]" if inverse else ""
 
     if scenario == "pre":
         if f_f is not None and p_f is not None:
-            if f_f > p_f:
-                strength = +1
-                reason_prefix = "Forecast > previous — base biased stronger"
-                headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} > "
-                            f"Previous {fmt_value(p, digits)} → {ccy} bias STRONGER")
-            elif f_f < p_f:
-                strength = -1
-                reason_prefix = "Forecast < previous — base biased weaker"
-                headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} < "
-                            f"Previous {fmt_value(p, digits)} → {ccy} bias WEAKER")
-            else:
+            if f_f == p_f:
                 strength = 0
                 reason_prefix = "Forecast = previous — no clear bias"
                 headline = (f"🔮 PREDICTED — Forecast matches Previous "
                             f"({fmt_value(f, digits)}) → no directional edge")
+            else:
+                # Normal: forecast > prev → +1 | Inverse: forecast > prev → -1
+                raw = +1 if f_f > p_f else -1
+                strength = raw if not inverse else -raw
+                if strength > 0:
+                    reason_prefix = f"{ccy} biased STRONGER"
+                    headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} "
+                                f"{'<' if f_f < p_f else '>'} Previous {fmt_value(p, digits)} "
+                                f"→ {ccy} bias STRONGER{tag}")
+                else:
+                    reason_prefix = f"{ccy} biased WEAKER"
+                    headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} "
+                                f"{'<' if f_f < p_f else '>'} Previous {fmt_value(p, digits)} "
+                                f"→ {ccy} bias WEAKER{tag}")
         else:
             strength = 0
             reason_prefix = "No forecast data — no clear bias"
             headline = "🔮 PREDICTED — no forecast available"
     elif scenario == "beat":
-        strength = +1
-        reason_prefix = "Beat forecast — base strengthens"
-        headline = (f"📈 BEAT — Actual {fmt_value(a, digits)} > "
-                    f"Forecast {fmt_value(f, digits)}")
+        raw = +1
+        strength = raw if not inverse else -raw
+        if strength > 0:
+            reason_prefix = "Beat forecast — base strengthens"
+            headline = (f"📈 BEAT — Actual {fmt_value(a, digits)} > "
+                        f"Forecast {fmt_value(f, digits)} → {ccy} STRONGER{tag}")
+        else:
+            reason_prefix = "Beat forecast — base weakens (inverse)"
+            headline = (f"📈 BEAT (inverse) — Actual {fmt_value(a, digits)} > "
+                        f"Forecast {fmt_value(f, digits)} → {ccy} WEAKER{tag}")
     elif scenario == "miss":
-        strength = -1
-        reason_prefix = "Missed forecast — base weakens"
-        headline = (f"📉 MISS — Actual {fmt_value(a, digits)} < "
-                    f"Forecast {fmt_value(f, digits)}")
+        raw = -1
+        strength = raw if not inverse else -raw
+        if strength < 0:
+            reason_prefix = "Missed forecast — base weakens"
+            headline = (f"📉 MISS — Actual {fmt_value(a, digits)} < "
+                        f"Forecast {fmt_value(f, digits)} → {ccy} WEAKER{tag}")
+        else:
+            reason_prefix = "Missed forecast — base strengthens (inverse)"
+            headline = (f"📉 MISS (inverse) — Actual {fmt_value(a, digits)} < "
+                        f"Forecast {fmt_value(f, digits)} → {ccy} STRONGER{tag}")
     elif scenario == "inline":
         strength = 0
         reason_prefix = "In-line with forecast — no directional edge"
@@ -346,7 +379,6 @@ def build_trade_advice(ev, matched_syms):
     conf_map = {"high": "High", "medium": "Medium", "low": "Low"}
     confidence = conf_map.get(imp, "Low")
 
-    # ✅ Only keep BUY / SELL rows — skip NO TRADE
     rows = []
     for sym in matched_syms:
         sig, cls = direction_for_symbol(sym, strength)
@@ -374,13 +406,13 @@ def build_trade_advice(ev, matched_syms):
         "hint":      "",
         "note":      note,
         "impact":    imp,
+        "inverse":   inverse,
     }
 
 
 def render_trade_advice_html(advice):
     if not advice:
         return ""
-    # ✅ If no valid BUY/SELL signals, don't render the block at all
     if not advice.get("rows"):
         return ""
 
@@ -395,7 +427,7 @@ def render_trade_advice_html(advice):
         sig = r["signal"]
         if sig == "BUY":
             badge = '<span class="sig sig-buy">🟢 BUY</span>'
-        else:  # SELL
+        else:
             badge = '<span class="sig sig-sell">🔴 SELL</span>'
         rows_html += (
             f'<tr><td class="adv-sym">{escape(r["symbol"])}</td>'
