@@ -17,15 +17,12 @@ KNOWN_CCY = [
     "CZK", "MXN", "ZAR", "SGD", "HKD", "RUB", "INR", "BRL",
 ]
 
-# --------------------------------------------------------------------
-# Inverse indicators — higher value is BAD for the currency
-# (e.g., more jobless claims = weaker economy = weaker currency)
-# --------------------------------------------------------------------
 INVERSE_KEYWORDS = [
     "jobless", "unemployment", "claims", "layoff", "layoffs",
     "dismissal", "bankrupt", "bankruptcy", "default",
-    "inventories", "stockpiles",     # rising inventories often bearish
+    "inventories", "stockpiles",
 ]
+
 
 def is_inverse_indicator(name):
     n = (name or "").lower()
@@ -86,6 +83,9 @@ def _get(obj, *names, default=None):
     return default
 
 
+# --------------------------------------------------------------------
+# 1. Live fetch via biquote — TODAY only
+# --------------------------------------------------------------------
 def fetch_free_news(today_only=True):
     try:
         from biquote import Biquote
@@ -162,35 +162,13 @@ def fetch_free_news(today_only=True):
         return None
 
 
+# --------------------------------------------------------------------
+# 2. Data loading (biquote only, with inline fallback)
+# --------------------------------------------------------------------
 LOCAL_NEWS = []
 
 
 def load_news(today_only=True):
-    if os.path.exists("news.json"):
-        try:
-            with open("news.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and data:
-                print(f"[✓] Loaded {len(data)} events from news.json.")
-                if today_only:
-                    today_tehran = datetime.now(TEHRAN_TZ).date()
-                    filt = []
-                    for e in data:
-                        t = e.get("time") or ""
-                        try:
-                            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            if dt.astimezone(TEHRAN_TZ).date() == today_tehran:
-                                filt.append(e)
-                        except Exception:
-                            filt.append(e)
-                    print(f"[i] Filtered to today (Tehran): {len(filt)} events.")
-                    return filt
-                return data
-        except Exception as ex:
-            print(f"[!] news.json parse error: {ex}")
-
     data = fetch_free_news(today_only=today_only)
     if data is not None:
         print(f"[✓] Using {len(data)} events from biquote.")
@@ -265,7 +243,7 @@ def matches_symbols(ev, symbols, relevant_ccys):
 
 
 # --------------------------------------------------------------------
-# 3b. Trade advice engine — inverse-aware, no WAIT/NO TRADE rows
+# 3b. Trade advice — inverse-aware, structured
 # --------------------------------------------------------------------
 def build_trade_advice(ev, matched_syms):
     name  = ev.get("name") or "Event"
@@ -328,7 +306,6 @@ def build_trade_advice(ev, matched_syms):
                 headline = (f"🔮 PREDICTED — Forecast matches Previous "
                             f"({fmt_value(f, digits)}) → no directional edge")
             else:
-                # Normal: forecast > prev → +1 | Inverse: forecast > prev → -1
                 raw = +1 if f_f > p_f else -1
                 strength = raw if not inverse else -raw
                 if strength > 0:
@@ -399,26 +376,24 @@ def build_trade_advice(ev, matched_syms):
         note = "ℹ️ LOW-impact event — moves may be small (5–20 pips). Edge is thin."
 
     return {
-        "scenario":  scenario,
-        "headline":  headline,
-        "rows":      rows,
+        "scenario":   scenario,
+        "headline":   headline,
+        "rows":       rows,
         "confidence": confidence,
-        "hint":      "",
-        "note":      note,
-        "impact":    imp,
-        "inverse":   inverse,
+        "hint":       "",
+        "note":       note,
+        "impact":     imp,
+        "inverse":    inverse,
+        "strength":   strength,
     }
 
 
 def render_trade_advice_html(advice):
-    if not advice:
-        return ""
-    if not advice.get("rows"):
+    if not advice or not advice.get("rows"):
         return ""
 
     html_parts = []
     html_parts.append(f'<div class="advice-headline">{advice["headline"]}</div>')
-
     if advice.get("hint"):
         html_parts.append(f'<div class="advice-hint">{advice["hint"]}</div>')
 
@@ -638,11 +613,218 @@ def build_payload(news, symbols, relevant_ccys):
     return out
 
 
+# --------------------------------------------------------------------
+# 6. 🤖 AI-friendly metadata export
+# --------------------------------------------------------------------
+def export_metadata(news, symbols, relevant_ccys, output="news_metadata.json"):
+    now_tehran = datetime.now(TEHRAN_TZ)
+    now_utc = now_tehran.astimezone(timezone.utc)
+
+    def num(x):
+        if x is None or x == "":
+            return None
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return None
+
+    events_out = []
+    for ev in news:
+        imp     = (ev.get("importance") or "low").lower()
+        name    = ev.get("name") or "Event"
+        ccy     = (ev.get("currency") or "").upper()
+        digits  = int(ev.get("digits") or 2)
+
+        a_f = num(ev.get("actual"))
+        f_f = num(ev.get("forecast"))
+        p_f = num(ev.get("previous"))
+        rp_f = num(ev.get("revisedPrevious"))
+
+        inverse = is_inverse_indicator(name)
+
+        surprise = None
+        surprise_pct = None
+        deviation = None
+        trend = None
+        trend_dir = None
+        released = a_f is not None
+        time_dt = parse_iso(ev.get("time"))
+        time_utc_iso = time_dt.astimezone(timezone.utc).isoformat() if time_dt else None
+        time_tehran_iso = time_dt.astimezone(TEHRAN_TZ).isoformat() if time_dt else None
+        seconds_until = None
+        is_upcoming = None
+        if time_dt:
+            delta = (time_dt - now_utc).total_seconds()
+            seconds_until = int(delta)
+            is_upcoming = delta > 0
+
+        if a_f is not None and f_f is not None:
+            deviation = a_f - f_f
+            surprise = "beat" if deviation > 0 else ("miss" if deviation < 0 else "inline")
+            if f_f != 0:
+                surprise_pct = round((deviation / abs(f_f)) * 100, 4)
+
+        if f_f is not None and p_f is not None:
+            diff = f_f - p_f
+            if diff > 0:
+                trend = "up"
+                trend_dir = "forecast higher than previous"
+            elif diff < 0:
+                trend = "down"
+                trend_dir = "forecast lower than previous"
+            else:
+                trend = "flat"
+                trend_dir = "forecast equals previous"
+
+        is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
+        advice = build_trade_advice(ev, matched) if (is_rel and matched) else None
+
+        symbol_signals = []
+        if advice:
+            for r in advice["rows"]:
+                symbol_signals.append({
+                    "symbol":       r["symbol"],
+                    "signal":       r["signal"],
+                    "reason":       r["reason"],
+                })
+
+        base_strength = advice["strength"] if advice else 0
+        base_strength_label = (
+            "stronger" if base_strength > 0 else
+            "weaker"   if base_strength < 0 else
+            "neutral"
+        )
+
+        events_out.append({
+            "id":               ev.get("id"),
+            "eventId":          ev.get("eventId"),
+            "name":             name,
+            "type":             ev.get("type"),
+            "sector":           ev.get("sector"),
+
+            "currency":         ccy,
+            "countryCode":      ev.get("countryCode"),
+            "importance":       imp,
+            "inverseIndicator": inverse,
+
+            "timeUtcIso":       time_utc_iso,
+            "timeTehranIso":    time_tehran_iso,
+            "timeUtcReadable":  to_utc(ev.get("time")),
+            "timeTehranReadable": to_tehran(ev.get("time")),
+            "period":           ev.get("period"),
+            "timeMode":         ev.get("timeMode"),
+            "secondsUntil":     seconds_until,
+            "isUpcoming":       is_upcoming,
+            "isReleased":       released,
+
+            "actual":           a_f,
+            "forecast":         f_f,
+            "previous":         p_f,
+            "revisedPrevious":  rp_f,
+            "revision":         ev.get("revision"),
+            "unit":             ev.get("unit"),
+            "multiplier":       ev.get("multiplier"),
+            "digits":           digits,
+
+            "deviation":        round(deviation, 4) if deviation is not None else None,
+            "surprise":         surprise,
+            "surprisePct":      surprise_pct,
+            "trend":            trend,
+            "trendDir":         trend_dir,
+
+            "isRelevant":       is_rel,
+            "matchedSymbols":   matched,
+
+            "tradeScenario":    advice["scenario"] if advice else None,
+            "baseCurrencyStrength": base_strength_label,
+            "baseStrengthValue": base_strength,
+            "tradeHeadline":    advice["headline"] if advice else None,
+            "tradeConfidence":  advice["confidence"] if advice else None,
+            "tradeNote":        advice["note"] if advice else None,
+            "symbolSignals":    symbol_signals,
+
+            "newsText":         ev.get("description") or build_summary(ev, symbols, relevant_ccys),
+            "source":           ev.get("source"),
+            "sourceUrl":        ev.get("sourceUrl"),
+        })
+
+    total      = len(events_out)
+    relevant   = [e for e in events_out if e["isRelevant"]]
+    upcoming   = [e for e in events_out if e["isUpcoming"]]
+    released   = [e for e in events_out if e["isReleased"]]
+    highs      = [e for e in events_out if e["importance"] == "high"]
+    mediums    = [e for e in events_out if e["importance"] == "medium"]
+    lows       = [e for e in events_out if e["importance"] == "low"]
+
+    next_event = None
+    if upcoming:
+        next_event = min(upcoming, key=lambda x: x["secondsUntil"])
+
+    buy_signals  = sum(1 for e in events_out for s in e["symbolSignals"] if s["signal"] == "BUY")
+    sell_signals = sum(1 for e in events_out for s in e["symbolSignals"] if s["signal"] == "SELL")
+
+    metadata = {
+        "meta": {
+            "generator":        "news_to_html.py",
+            "schemaVersion":    "1.0",
+            "generatedAtTehran": now_tehran.isoformat(),
+            "generatedAtUtc":   now_utc.isoformat(),
+            "timezone":         "Asia/Tehran (UTC+3:30)",
+            "dataSource":       events_out[0]["source"] if events_out else None,
+            "note": (
+                "Rich structured export for AI analysis. "
+                "Includes raw event data, derived analytics, and per-symbol trade signals."
+            ),
+        },
+        "marketContext": {
+            "connectedSymbols":       symbols,
+            "symbolCount":            len(symbols),
+            "relevantCurrencies":     sorted(relevant_ccys),
+            "relevantCurrencyCount":  len(relevant_ccys),
+            "inverseKeywordsApplied": INVERSE_KEYWORDS,
+        },
+        "statistics": {
+            "totalEvents":        total,
+            "relevantEvents":     len(relevant),
+            "upcomingEvents":     len(upcoming),
+            "releasedEvents":     len(released),
+            "highImpact":         len(highs),
+            "mediumImpact":       len(mediums),
+            "lowImpact":          len(lows),
+            "totalBuySignals":    buy_signals,
+            "totalSellSignals":   sell_signals,
+        },
+        "nextEvent": {
+            "name":         next_event["name"] if next_event else None,
+            "currency":     next_event["currency"] if next_event else None,
+            "timeTehran":   next_event["timeTehranReadable"] if next_event else None,
+            "secondsUntil": next_event["secondsUntil"] if next_event else None,
+            "importance":   next_event["importance"] if next_event else None,
+            "isRelevant":   next_event["isRelevant"] if next_event else None,
+        } if next_event else None,
+        "events": events_out,
+    }
+
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    print(f"[✓] AI metadata written → {os.path.abspath(output)}")
+    print(f"[i] {total} events, {len(relevant)} relevant, "
+          f"{buy_signals} BUY signals, {sell_signals} SELL signals")
+    return output
+
+
+# --------------------------------------------------------------------
+# 7. HTML generation
+# --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
     symbols = get_connected_symbols()
     relevant_ccys = relevant_currencies(symbols)
     print(f"[i] Connected symbols: {', '.join(symbols)}")
     print(f"[i] Relevant currencies: {', '.join(sorted(relevant_ccys))}")
+
+    # 🤖 Export AI metadata BEFORE building HTML
+    export_metadata(news, symbols, relevant_ccys, output="news_metadata.json")
 
     def sort_key(e):
         dt = parse_iso(e.get("time"))

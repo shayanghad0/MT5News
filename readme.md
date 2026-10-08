@@ -1,6 +1,11 @@
 # 📊 MQL5 Economic News → HTML Report
 
-A free, local Python tool that fetches economic news/calendar events, filters them by relevance to your **connected MT5 symbols**, predicts **BUY/SELL signals** for upcoming releases, and exports everything to a single self-contained **HTML dashboard** — no API credits required.
+A free, local Python tool that fetches economic news/calendar events, filters them by relevance to your **connected MT5 symbols**, predicts **BUY/SELL signals** for upcoming releases, and exports everything to:
+
+- 🎨 A single self-contained **HTML dashboard** for humans
+- 🤖 A rich **structured JSON** (`news_metadata.json`) for AI analysis
+
+**No API credits required.**
 
 ---
 
@@ -8,18 +13,20 @@ A free, local Python tool that fetches economic news/calendar events, filters th
 
 | Feature | Description |
 |---|---|
-| 🆓 **100% Free** | Uses `biquote` (no API key) or your local `news.json` export |
+| 🆓 **100% Free** | Uses `biquote` (no API key, no signup) |
 | 📅 **Today-Only Filter** | Auto-filters events to today's Tehran date |
 | 🕒 **Tehran Timezone** | All times shown as **UTC+3:30** (Iran Standard Time) |
-| ⏱ **Live Countdown** | Banner at the top shows time until the next event (updates every second) |
+| ⏱ **Live Countdown** | Top banner shows time until the next event (updates every second) |
 | 🔔 **Row Countdown** | Every row shows "from now" — live-updating without page refresh |
 | ✅ **Symbol Relevance** | Auto-detects your connected MT5 symbols → marks rows ✅ / ❎ |
 | 🥇 **XAUUSD Gold Glow** | Pulsing gold neon on rows affecting gold |
 | 🔵 **XAGUSD Cyan Glow** | Pulsing cyan neon on rows affecting silver |
 | 💹 **Trade Analysis** | Auto BUY/SELL signal for each relevant symbol |
 | 🔄 **Inverse-Aware** | Handles Jobless Claims, Inventories, etc. correctly |
+| 🚫 **No NO-TRADE Rows** | Only shows actionable BUY/SELL signals |
 | 🎴 **Detail Card Modal** | Click any row → full data + news narrative + trade advice |
-| 🔍 **Live Filters** | Search by name, filter by impact, currency, relevance, upcoming-only |
+| 🔍 **Live Filters** | Search, impact, currency, relevance, upcoming-only |
+| 🤖 **AI Metadata Export** | `news_metadata.json` with raw data + analytics + signals |
 | 📱 **Responsive** | Works on desktop, tablet, and mobile |
 
 ---
@@ -32,7 +39,7 @@ A free, local Python tool that fetches economic news/calendar events, filters th
 pip install biquote
 ```
 
-*Optional but recommended — for live MT5 symbol detection:*
+*Optional — for live MT5 symbol detection:*
 
 ```powershell
 pip install MetaTrader5
@@ -45,13 +52,10 @@ cd C:\Users\Shayan\Desktop\YTStrategy
 py news_to_html.py
 ```
 
-### 3. Open the report
+### 3. Open the outputs
 
-```
-news_report.html
-```
-
-Double-click it, or open it in any browser.
+- **`news_report.html`** — the visual dashboard
+- **`news_metadata.json`** — structured data for AI analysis
 
 ---
 
@@ -60,48 +64,104 @@ Double-click it, or open it in any browser.
 ```
 YTStrategy/
 ├── news_to_html.py        # Main script
-├── news_report.html       # Generated report (open in browser)
-├── news.json              # OPTIONAL: your MQL5 export (fallback data)
+├── news_report.html       # 📊 Generated HTML dashboard
+├── news_metadata.json     # 🤖 Generated AI-friendly JSON
 └── README.md              # This file
 ```
 
+> **Note:** `news.json` is **no longer used**. The script fetches live data directly from `biquote`. You can safely delete any old `news.json` file.
+
 ---
 
-## 🔌 Data Sources (in priority order)
+## 🔌 Data Flow
 
-The script tries these in order:
+The script fetches news in this order:
 
 | # | Source | When used |
 |---|---|---|
-| 1 | **`news.json`** (local file) | If the file exists and contains a JSON array |
-| 2 | **`biquote`** live fetch | If `news.json` is missing/empty |
-| 3 | **`LOCAL_NEWS`** (inline in script) | If both above fail |
+| 1 | **`biquote`** live fetch | Always tried first |
+| 2 | **`LOCAL_NEWS`** (inline list in script) | If biquote fails |
+| 3 | *(nothing)* | Prints warning, exits cleanly |
 
-### Example `news.json` (MQL5 export format)
+---
+
+## 📤 Output Files
+
+Every run produces **two files**:
+
+### 📊 `news_report.html`
+
+- Self-contained (CSS + JS embedded)
+- Interactive filters, live countdowns, click-to-open modal cards
+- No internet needed after the initial fetch
+- Opens in any browser
+
+### 🤖 `news_metadata.json`
+
+A rich structured export designed for AI analysis. Contains:
+
+| Section | Contents |
+|---|---|
+| `meta` | Generator version, timestamps, schema info |
+| `marketContext` | Connected symbols, currencies, inverse keywords |
+| `statistics` | Aggregate counts (high/medium/low, BUY/SELL totals) |
+| `nextEvent` | Info about the next upcoming release |
+| `events[]` | Per-event records with **raw numbers** + **derived analytics** + **per-symbol signals** |
+
+**Example event record:**
 
 ```json
-[
-  {
-    "id": "mql5:317675",
-    "eventId": "mql5:840140001",
-    "time": "2026-10-08T12:30:00Z",
-    "period": "2026-10-03T00:00:00Z",
-    "countryCode": "US",
-    "currency": "USD",
-    "name": "Initial Jobless Claims",
-    "importance": "high",
-    "type": "indicator",
-    "sector": "jobs",
-    "unit": "none",
-    "multiplier": "thousands",
-    "digits": 0,
-    "actual": null,
-    "forecast": 190,
-    "previous": 197,
-    "sourceUrl": "https://www.dol.gov",
-    "source": "mql5"
-  }
+{
+  "name": "Initial Jobless Claims",
+  "currency": "USD",
+  "importance": "high",
+  "inverseIndicator": true,
+  "actual": null,
+  "forecast": 190.0,
+  "previous": 197.0,
+  "deviation": null,
+  "surprise": null,
+  "trend": "down",
+  "trendDir": "forecast lower than previous",
+  "isUpcoming": true,
+  "isReleased": false,
+  "secondsUntil": 1800,
+  "isRelevant": true,
+  "matchedSymbols": ["XAUUSD", "XAGUSD", "EURUSD", "..."],
+  "tradeScenario": "pre",
+  "baseCurrencyStrength": "stronger",
+  "tradeHeadline": "🔮 PREDICTED — Forecast 190 < Previous 197 → USD bias STRONGER [inverse]",
+  "symbolSignals": [
+    {"symbol": "XAUUSD", "signal": "SELL", "reason": "USD biased STRONGER"},
+    {"symbol": "XAGUSD", "signal": "SELL", "reason": "USD biased STRONGER"}
+  ],
+  "newsText": "Initial Jobless Claims is a high-impact release..."
+}
+```
+
+### 🤖 How to Use the Metadata with an AI
+
+```python
+import json
+
+with open("news_metadata.json") as f:
+    data = json.load(f)
+
+# Filter to high-impact upcoming relevant events
+relevant = [
+    e for e in data["events"]
+    if e["isUpcoming"] and e["isRelevant"] and e["importance"] == "high"
 ]
+
+# Feed to ChatGPT / Claude / etc.:
+prompt = f"""
+Here is today's economic calendar in structured JSON.
+Analyse which events are most likely to move my symbols
+({', '.join(data['marketContext']['connectedSymbols'])})
+and suggest a trading plan.
+
+Data: {json.dumps(relevant, indent=2)}
+"""
 ```
 
 ---
@@ -146,7 +206,8 @@ Any event whose currency matches one of those gets **✅** in the X column.
 | Forecast < Previous | Weakens 📉 | SELL base pairs, BUY base-quote pairs |
 | Actual > Forecast | Beat → Strengthens 📈 | Same as above |
 | Actual < Forecast | Miss → Weakens 📉 | Same as above |
-| In-line | Neutral | Block hidden |
+| In-line | Neutral | **Block hidden** |
+| No data | Neutral | **Block hidden** |
 
 ### Inverse indicators (higher = weaker currency)
 
@@ -161,6 +222,10 @@ For these, the signal logic flips. Example:
 > → Fewer claims = **good for USD** → **USD strengthens** → **SELL XAUUSD** ✅
 
 The headline shows `[inverse]` so you know why.
+
+### No NO-TRADE clutter
+
+When a signal would be "NO TRADE", that row is **skipped entirely**. If all matched symbols end up with no signal, the **entire Trade Analysis block is hidden** on the card. You only ever see actionable **🟢 BUY** or **🔴 SELL**.
 
 ---
 
@@ -222,7 +287,7 @@ INVERSE_KEYWORDS = [
 ]
 ```
 
-### Fetch only today vs. all events
+### Fetch today vs. all events
 
 At the bottom of the script:
 
@@ -236,7 +301,7 @@ news = load_news(today_only=True)   # or False for all events
 
 ```
 ┌─────────────────┐
-│  1. Load News   │  news.json → biquote → LOCAL_NEWS
+│  1. Fetch News  │  biquote → LOCAL_NEWS → warn
 └────────┬────────┘
          │
          ▼
@@ -257,11 +322,13 @@ news = load_news(today_only=True)   # or False for all events
 │    Advice       │  Skip NO TRADE rows entirely
 └────────┬────────┘
          │
-         ▼
-┌─────────────────┐
-│ 5. Render HTML  │  Single self-contained file with CSS + JS
-│    Report       │  Live countdown, filters, modal card
-└─────────────────┘
+         ├──────────────────┐
+         ▼                  ▼
+┌─────────────────┐  ┌──────────────────┐
+│ 5a. Export      │  │ 5b. Render HTML  │
+│  Metadata JSON  │  │  Report          │
+│  (for AI)       │  │  (for humans)    │
+└─────────────────┘  └──────────────────┘
 ```
 
 ---
@@ -310,6 +377,19 @@ news = load_news(today_only=True)   # or False for all events
 
 ---
 
+### ❌ Trade Analysis block missing from card
+
+**Not a bug.** If all matched symbols would produce NO TRADE (in-line result, no forecast, no data), the block is hidden entirely by design.
+
+---
+
+### ❌ `news_metadata.json` is too large
+
+**Cause:** The file includes every event with full analytics.
+**Fix:** Filter with Python after loading — e.g., keep only `isRelevant: true` events. Or edit `export_metadata()` to skip irrelevant events.
+
+---
+
 ## 📋 Requirements
 
 - **Python** 3.8+
@@ -327,6 +407,9 @@ news = load_news(today_only=True)   # or False for all events
 [i] Relevant currencies: AUD, EUR, GBP, JPY, USD, XAG, XAU, ZAR
 [i] biquote returned 42 raw events.
 [i] Filtered to today (Tehran): 12 events.
+[✓] Using 12 events from biquote.
+[✓] AI metadata written → C:\Users\Shayan\Desktop\YTStrategy\news_metadata.json
+[i] 12 events, 9 relevant, 42 BUY signals, 38 SELL signals
 [✓] HTML report written → C:\Users\Shayan\Desktop\YTStrategy\news_report.html
 [i] Breakdown — High: 5 | Medium: 4 | Low: 3 | Relevant: 9 | Total: 12
 ```
@@ -335,12 +418,24 @@ news = load_news(today_only=True)   # or False for all events
 
 ## 🎯 Typical Workflow
 
+### Manual (for trading)
+
 1. **Morning** — Run `py news_to_html.py`
 2. **Open** `news_report.html` in your browser
 3. **Watch** the ⏱ NEXT banner countdown
 4. **Click** any relevant row for full analysis
 5. **Trade** the BUY/SELL signals the card suggests
 6. **Re-run** the script for updated data (e.g., every 30 minutes)
+
+### AI-Assisted (for deeper analysis)
+
+1. Run `py news_to_html.py` → generates `news_metadata.json`
+2. Load it in a Python notebook / ChatGPT / Claude
+3. Ask questions like:
+   - *"Which events today are most likely to move XAUUSD?"*
+   - *"Rank the high-impact events by expected volatility."*
+   - *"Build me a trading plan for the next 4 hours."*
+4. Cross-check with `news_report.html` before executing
 
 ---
 
@@ -376,8 +471,8 @@ If something breaks:
 
 1. Check the **Troubleshooting** section above.
 2. Run the script and **copy the console output** — it prints diagnostic info.
-3. Verify your `news.json` is valid JSON (use an online validator).
-4. Confirm Python version: `py --version` (should be 3.8+).
+3. Confirm Python version: `py --version` (should be 3.8+).
+4. Check `news_metadata.json` — it contains the exact data the script is working with.
 
 ---
 
