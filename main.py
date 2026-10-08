@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from html import escape
 
 # --------------------------------------------------------------------
@@ -14,7 +14,7 @@ TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
 FALLBACK_SYMBOLS = ["XAUUSD", "XAGUSD"]
 
 KNOWN_CCY = [
-    "XAU", "XAG", "XPT", "XPD",         # metals
+    "XAU", "XAG", "XPT", "XPD",
     "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
     "CNH", "CNY", "TRY", "SEK", "NOK", "DKK", "PLN", "HUF",
     "CZK", "MXN", "ZAR", "SGD", "HKD", "RUB", "INR", "BRL",
@@ -65,7 +65,7 @@ def relevant_currencies(symbols):
 
 
 # --------------------------------------------------------------------
-# 1. Free live fetch via biquote — fetches ALL events
+# 1. Free live fetch via biquote — TODAY only
 # --------------------------------------------------------------------
 def _get(obj, *names, default=None):
     for n in names:
@@ -78,17 +78,56 @@ def _get(obj, *names, default=None):
     return default
 
 
-def fetch_free_news():
+def fetch_free_news(today_only=True):
+    """
+    Fetch news. If today_only=True, tries to get only today's events.
+    Falls back to full calendar + client-side filter.
+    """
     try:
         from biquote import Biquote
         bq = Biquote()
-        events = bq.calendar()
 
-        print(f"[i] biquote returned {len(events)} raw events (ALL importance).")
+        events = None
+        if today_only:
+            # Try date-range fetch first
+            today = date.today()
+            try:
+                events = bq.calendar(from_date=today, to_date=today)
+                print(f"[i] biquote date-range fetch returned {len(events) if events else 0} events.")
+            except TypeError:
+                # Older biquote versions may not accept from_date/to_date
+                print("[i] biquote does not support date-range — falling back to full calendar.")
+                events = None
+            except Exception as ex:
+                print(f"[i] Date-range fetch failed ({ex}) — falling back to full calendar.")
+
+        if events is None:
+            events = bq.calendar()
+
+        print(f"[i] biquote returned {len(events)} raw events.")
         if events:
             sample = events[0]
             fields = sample.keys() if isinstance(sample, dict) else vars(sample)
             print(f"[i] Sample fields: {list(fields)}")
+
+        # Filter to today (Tehran date) if needed
+        if today_only:
+            today_tehran = datetime.now(TEHRAN_TZ).date()
+            filtered = []
+            for e in events:
+                raw = _get(e, 'date', 'datetime', 'time', 'timestamp', default='')
+                if not raw:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt.astimezone(TEHRAN_TZ).date() == today_tehran:
+                        filtered.append(e)
+                except Exception:
+                    filtered.append(e)   # keep unparsable, don't lose it
+            print(f"[i] Filtered to today (Tehran): {len(filtered)} events.")
+            events = filtered
 
         converted = []
         for e in events:
@@ -128,20 +167,35 @@ def fetch_free_news():
 LOCAL_NEWS = []
 
 
-def load_news():
+def load_news(today_only=True):
     if os.path.exists("news.json"):
         try:
             with open("news.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list) and data:
                 print(f"[✓] Loaded {len(data)} events from news.json.")
+                if today_only:
+                    today_tehran = datetime.now(TEHRAN_TZ).date()
+                    filt = []
+                    for e in data:
+                        t = e.get("time") or ""
+                        try:
+                            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt.astimezone(TEHRAN_TZ).date() == today_tehran:
+                                filt.append(e)
+                        except Exception:
+                            filt.append(e)
+                    print(f"[i] Filtered to today (Tehran): {len(filt)} events.")
+                    return filt
                 return data
         except Exception as ex:
             print(f"[!] news.json parse error: {ex}")
 
-    data = fetch_free_news()
-    if data:
-        print(f"[✓] Using {len(data)} events from biquote (ALL importance).")
+    data = fetch_free_news(today_only=today_only)
+    if data is not None:
+        print(f"[✓] Using {len(data)} events from biquote.")
         return data
 
     if LOCAL_NEWS:
@@ -164,30 +218,39 @@ IMPORTANCE_COLORS = {
 }
 
 
-def to_tehran(iso_str):
+def parse_iso(iso_str):
     if not iso_str:
-        return ""
+        return None
     s = str(iso_str).strip()
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
+        return dt
     except Exception:
-        return s
+        return None
+
+
+def to_tehran(iso_str):
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return str(iso_str or "")
+    return dt.astimezone(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
 
 
 def to_utc(iso_str):
-    if not iso_str:
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return str(iso_str or "")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def to_iso_utc(iso_str):
+    """Return ISO-8601 UTC string for JS parsing."""
+    dt = parse_iso(iso_str)
+    if dt is None:
         return ""
-    s = str(iso_str).strip()
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return s
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def fmt_value(v, digits=2):
@@ -348,7 +411,6 @@ def build_row(ev, idx, symbols, relevant_ccys):
     rel_cls  = "yes" if is_rel else "no"
     rel_title = f"Affects: {', '.join(matched)}" if is_rel else "Not relevant to your symbols"
 
-    # 🎯 Neon highlight ONLY for XAUUSD / XAGUSD
     neon_cls = ""
     if is_rel:
         if "XAUUSD" in matched:
@@ -360,6 +422,7 @@ def build_row(ev, idx, symbols, relevant_ccys):
     <tr class="row {neon_cls}" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}" data-relevant="{1 if is_rel else 0}">
       <td class="xcol"><span class="xmark {rel_cls}" title="{escape(rel_title)}">{rel_mark}</span></td>
       <td>{escape(str(t))}</td>
+      <td class="rel-time" data-iso="{escape(to_iso_utc(ev.get('time')))}">—</td>
       <td><span class="ccy">{escape(str(ev.get('currency','')))}</span></td>
       <td><span class="badge" style="background:{bg};color:{color};border:1px solid {color}">{imp.upper()}</span></td>
       <td class="name">{escape(str(ev.get('name','')))}</td>
@@ -391,6 +454,7 @@ def build_payload(news, symbols, relevant_ccys):
             "impBg":       bg,
             "timeTehran":  to_tehran(ev.get("time")) or "—",
             "timeUtc":     to_utc(ev.get("time")) or "—",
+            "timeIso":     to_iso_utc(ev.get("time")),
             "period":      ev.get("period") or "—",
             "actual":      fmt_value(ev.get("actual"),   ev.get("digits") or 2),
             "forecast":    fmt_value(ev.get("forecast"), ev.get("digits") or 2),
@@ -424,20 +488,16 @@ def generate_html(news, output="news_report.html"):
     print(f"[i] Relevant currencies: {', '.join(sorted(relevant_ccys))}")
 
     def sort_key(e):
-        t = e.get("time") or ""
-        try:
-            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            return datetime.max.replace(tzinfo=timezone.utc)
+        dt = parse_iso(e.get("time"))
+        return dt if dt else datetime.max.replace(tzinfo=timezone.utc)
 
     news = sorted(news, key=sort_key)
     rows = "\n".join(build_row(e, i, symbols, relevant_ccys) for i, e in enumerate(news))
     payload_json = json.dumps(build_payload(news, symbols, relevant_ccys), ensure_ascii=False)
 
-    generated_at = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M Tehran")
+    now_tehran = datetime.now(TEHRAN_TZ)
+    generated_at = now_tehran.strftime("%Y-%m-%d %H:%M Tehran")
+    today_str = now_tehran.strftime("%A, %d %B %Y")
     total = len(news)
     highs   = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
@@ -456,7 +516,7 @@ def generate_html(news, output="news_report.html"):
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>MQL5 Economic News Report — ALL Events</title>
+<title>MQL5 Economic News — {today_str}</title>
 <style>
   :root {{
     --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0;
@@ -473,6 +533,37 @@ def generate_html(news, output="news_report.html"):
   }}
   h1 {{ font-size: 22px; margin: 0; }}
   .meta {{ color: var(--muted); font-size: 13px; }}
+
+  /* ⏱ Next-news countdown banner */
+  .next-banner {{
+    background: linear-gradient(135deg, #0b1220 0%, #162033 100%);
+    border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 14px;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 14px;
+  }}
+  .next-banner.empty {{
+    border-left-color: #64748b; opacity: .8;
+  }}
+  .next-banner .left {{ display: flex; flex-direction: column; gap: 4px; }}
+  .next-banner .lbl {{
+    color: var(--accent); font-size: 11px; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase;
+  }}
+  .next-banner.empty .lbl {{ color: var(--muted); }}
+  .next-banner .name {{ font-size: 16px; font-weight: 600; }}
+  .next-banner .sub {{ color: var(--muted); font-size: 12px; }}
+  .countdown {{
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 26px; font-weight: 700; color: var(--accent);
+    letter-spacing: .05em; white-space: nowrap;
+  }}
+  .countdown .unit {{ font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 2px; }}
+  .countdown.soon {{ color: #fbbf24; animation: blink 1s ease-in-out infinite; }}
+  .countdown.live {{ color: #4ade80; }}
+  .countdown.past {{ color: var(--muted); }}
+  @keyframes blink {{ 50% {{ opacity: .5; }} }}
+
   .symbols-bar {{
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;
@@ -519,6 +610,9 @@ def generate_html(news, output="news_report.html"):
   .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
   .num.beat {{ color: #4ade80; font-weight: 600; }}
   .num.miss {{ color: #f87171; font-weight: 600; }}
+  .rel-time {{ font-family: "SF Mono", Consolas, monospace; font-size: 12px; color: var(--muted); white-space: nowrap; }}
+  .rel-time.soon {{ color: #fbbf24; font-weight: 600; }}
+  .rel-time.live {{ color: #4ade80; font-weight: 600; }}
   .ccy {{
     display: inline-block; background: #0b1220; border: 1px solid var(--border);
     padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;
@@ -533,7 +627,19 @@ def generate_html(news, output="news_report.html"):
   .xmark.no  {{ opacity: .55; }}
   footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; }}
 
-  /* ✨ Neon highlight for XAUUSD / XAGUSD rows */
+  /* Next-event row pulse */
+  tbody tr.is-next td {{
+    background: rgba(56,189,248,.10);
+  }}
+  tbody tr.is-next td:last-child::after {{
+    content: "⏱ NEXT";
+    display: inline-block; margin-left: 8px;
+    font-size: 10px; font-weight: 700; letter-spacing: .06em;
+    color: #0b1220; background: var(--accent);
+    padding: 2px 6px; border-radius: 4px;
+  }}
+
+  /* Neon highlights */
   tbody tr.neon td {{
     background: rgba(56, 189, 248, 0.06);
     border-bottom-color: rgba(56, 189, 248, 0.25);
@@ -542,19 +648,11 @@ def generate_html(news, output="news_report.html"):
     box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9);
     animation: neonPulse 2.2s ease-in-out infinite;
   }}
-  tbody tr.neon:hover td {{
-    background: rgba(56, 189, 248, 0.12);
-  }}
+  tbody tr.neon:hover td {{ background: rgba(56, 189, 248, 0.12); }}
   @keyframes neonPulse {{
-    0%, 100% {{
-      box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9);
-    }}
-    50% {{
-      box-shadow: inset 3px 0 0 0 #7dd3fc, inset 6px 0 26px -6px rgba(125,211,252,1);
-    }}
+    0%, 100% {{ box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9); }}
+    50%      {{ box-shadow: inset 3px 0 0 0 #7dd3fc, inset 6px 0 26px -6px rgba(125,211,252,1); }}
   }}
-
-  /* 🥇 Golden neon for XAU */
   tbody tr.neon.gold td {{
     background: rgba(251, 191, 36, 0.07);
     border-bottom-color: rgba(251, 191, 36, 0.25);
@@ -563,16 +661,10 @@ def generate_html(news, output="news_report.html"):
     box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9);
     animation: neonPulseGold 2.2s ease-in-out infinite;
   }}
-  tbody tr.neon.gold:hover td {{
-    background: rgba(251, 191, 36, 0.13);
-  }}
+  tbody tr.neon.gold:hover td {{ background: rgba(251, 191, 36, 0.13); }}
   @keyframes neonPulseGold {{
-    0%, 100% {{
-      box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9);
-    }}
-    50% {{
-      box-shadow: inset 3px 0 0 0 #fde68a, inset 6px 0 26px -6px rgba(253,230,138,1);
-    }}
+    0%, 100% {{ box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9); }}
+    50%      {{ box-shadow: inset 3px 0 0 0 #fde68a, inset 6px 0 26px -6px rgba(253,230,138,1); }}
   }}
 
   /* ---------- Modal / Card ---------- */
@@ -611,12 +703,8 @@ def generate_html(news, output="news_report.html"):
     padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
     font-size: 13px; font-weight: 600;
   }}
-  .rel-banner.yes {{
-    background: rgba(74,222,128,.1); border: 1px solid rgba(74,222,128,.4); color: #86efac;
-  }}
-  .rel-banner.no {{
-    background: rgba(148,163,184,.1); border: 1px solid rgba(148,163,184,.3); color: var(--muted);
-  }}
+  .rel-banner.yes {{ background: rgba(74,222,128,.1); border: 1px solid rgba(74,222,128,.4); color: #86efac; }}
+  .rel-banner.no  {{ background: rgba(148,163,184,.1); border: 1px solid rgba(148,163,184,.3); color: var(--muted); }}
 
   .grid {{
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -626,10 +714,7 @@ def generate_html(news, output="news_report.html"):
     background: #0b1220; border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 10px;
   }}
-  .field .k {{
-    color: var(--muted); font-size: 10px; text-transform: uppercase;
-    letter-spacing: .05em; margin-bottom: 3px;
-  }}
+  .field .k {{ color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }}
   .field .v {{ font-size: 14px; font-weight: 600; word-break: break-word; }}
   .field .v.big {{ font-size: 18px; }}
   .field .v.beat {{ color: #4ade80; }}
@@ -663,9 +748,19 @@ def generate_html(news, output="news_report.html"):
 </head>
 <body>
   <header>
-    <h1>📊 MQL5 Economic News Report — ALL Events</h1>
-    <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events &nbsp;•&nbsp; Click any row for details</div>
+    <h1>📊 MQL5 Economic News — {today_str}</h1>
+    <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events today &nbsp;•&nbsp; Click any row for details</div>
   </header>
+
+  <!-- ⏱ Next news countdown -->
+  <div class="next-banner" id="nextBanner">
+    <div class="left">
+      <div class="lbl">⏱ Next event</div>
+      <div class="name" id="nextName">Loading…</div>
+      <div class="sub" id="nextSub">—</div>
+    </div>
+    <div class="countdown" id="countdown">—</div>
+  </div>
 
   <div class="symbols-bar">
     <span class="lbl">🔌 Connected symbols:</span>
@@ -701,6 +796,10 @@ def generate_html(news, output="news_report.html"):
       <input type="checkbox" id="relFilter" onchange="filterRows()">
       ✅ Only relevant to my symbols
     </label>
+    <label class="chk-label">
+      <input type="checkbox" id="upFilter" onchange="filterRows()">
+      ⏱ Only upcoming
+    </label>
     <span id="visibleCount" class="meta" style="align-self:center"></span>
   </div>
 
@@ -708,7 +807,9 @@ def generate_html(news, output="news_report.html"):
     <thead>
       <tr>
         <th class="xcol" title="Relevance to your connected symbols">X</th>
-        <th>Time (Tehran)</th><th>CCY</th><th>Impact</th><th>Event</th>
+        <th>Time (Tehran)</th>
+        <th>From now</th>
+        <th>CCY</th><th>Impact</th><th>Event</th>
         <th style="text-align:right">Actual</th>
         <th style="text-align:right">Forecast</th>
         <th style="text-align:right">Previous</th>
@@ -720,7 +821,7 @@ def generate_html(news, output="news_report.html"):
     </tbody>
   </table>
 
-  <footer>Generated locally • No API credits used • Times shown in Tehran (UTC+3:30)</footer>
+  <footer>Generated locally • No API credits used • All times shown in Tehran (UTC+3:30)</footer>
 
   <!-- 🔔 News detail card -->
   <div class="backdrop" id="backdrop" onclick="if(event.target===this) closeCard()">
@@ -749,6 +850,98 @@ def generate_html(news, output="news_report.html"):
 <script>
 const NEWS = {payload_json};
 
+/* ---------- Relative time / countdown helpers ---------- */
+function humanDelta(ms) {{
+  const past = ms < 0;
+  let s = Math.abs(Math.floor(ms / 1000));
+  const d = Math.floor(s / 86400); s %= 86400;
+  const h = Math.floor(s / 3600);  s %= 3600;
+  const m = Math.floor(s / 60);    s %= 60;
+  let parts = [];
+  if (d) parts.push(d + 'd');
+  if (h || d) parts.push(h + 'h');
+  parts.push(m + 'm');
+  if (!d && !h) parts.push(s + 's');
+  return (past ? '−' : 'in ') + parts.join(' ');
+}}
+
+function shortDelta(ms) {{
+  const past = ms < 0;
+  let s = Math.abs(Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600); s %= 3600;
+  const m = Math.floor(s / 60);   s %= 60;
+  if (h > 0) return (past ? '−' : '') + h + 'h ' + m + 'm';
+  if (m > 0) return (past ? '−' : '') + m + 'm ' + s + 's';
+  return (past ? '−' : '') + s + 's';
+}}
+
+/* ---------- Refresh every second ---------- */
+function tick() {{
+  const now = Date.now();
+
+  /* Update each row's "From now" column */
+  document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
+    const cell = tr.querySelector('.rel-time');
+    if (!cell) return;
+    const iso = cell.dataset.iso;
+    if (!iso) {{ cell.textContent = '—'; return; }}
+    const t = new Date(iso).getTime();
+    const delta = t - now;
+    cell.textContent = humanDelta(delta);
+    cell.classList.toggle('live', Math.abs(delta) < 60000);
+    cell.classList.toggle('soon', delta > 0 && delta < 900000); /* <15min */
+  }});
+
+  /* Find the next upcoming event */
+  let next = null;
+  NEWS.forEach(n => {{
+    if (!n.timeIso) return;
+    const t = new Date(n.timeIso).getTime();
+    if (t > now && (!next || t < new Date(next.timeIso).getTime())) {{
+      next = n;
+    }}
+  }});
+
+  const banner = document.getElementById('nextBanner');
+  const nameEl = document.getElementById('nextName');
+  const subEl  = document.getElementById('nextSub');
+  const cdEl   = document.getElementById('countdown');
+
+  /* Clear previous NEXT marker */
+  document.querySelectorAll('tr.is-next').forEach(r => r.classList.remove('is-next'));
+
+  if (next) {{
+    banner.classList.remove('empty');
+    nameEl.textContent = next.name;
+    const matched = next.matchedSyms && next.matchedSyms.length
+      ? ' · affects ' + next.matchedSyms.join(', ')
+      : '';
+    subEl.textContent = next.timeTehran + ' · ' + next.currency + ' · ' +
+                        next.importance.toUpperCase() + matched;
+
+    const delta = new Date(next.timeIso).getTime() - now;
+    cdEl.textContent = shortDelta(delta);
+    cdEl.classList.toggle('soon', delta < 900000 && delta > 0);
+    cdEl.classList.toggle('live', Math.abs(delta) < 60000);
+    cdEl.classList.remove('past');
+
+    /* Mark the row */
+    const idx = NEWS.indexOf(next);
+    const row = document.querySelector(`tr[data-idx="${{idx}}"]`);
+    if (row) row.classList.add('is-next');
+  }} else {{
+    banner.classList.add('empty');
+    nameEl.textContent = 'No more events today';
+    subEl.textContent = 'All scheduled events have passed.';
+    cdEl.textContent = '—';
+    cdEl.className = 'countdown past';
+  }}
+}}
+
+setInterval(tick, 1000);
+tick();
+
+/* ---------- Modal ---------- */
 function field(k, v, cls="") {{
   return `<div class="field"><div class="k">${{k}}</div><div class="v ${{cls}}">${{v}}</div></div>`;
 }}
@@ -774,8 +967,15 @@ function openCard(idx) {{
   const a = parseFloat(n.actual), f = parseFloat(n.forecast);
   if (!isNaN(a) && !isNaN(f)) aCls = a > f ? "beat" : (a < f ? "miss" : "");
 
+  let relTxt = '—';
+  if (n.timeIso) {{
+    const delta = new Date(n.timeIso).getTime() - Date.now();
+    relTxt = humanDelta(delta);
+  }}
+
   const grid = [
     field("Time (Tehran)", n.timeTehran, "big"),
+    field("From now",      relTxt),
     field("Time (UTC)",    n.timeUtc),
     field("Actual",        n.actual,   aCls),
     field("Forecast",      n.forecast),
@@ -819,18 +1019,24 @@ document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
   tr.addEventListener('click', () => openCard(parseInt(tr.dataset.idx, 10)));
 }});
 
+/* ---------- Filtering ---------- */
 function filterRows() {{
   const q    = document.getElementById('search').value.toLowerCase();
   const imp  = document.getElementById('impFilter').value;
   const ccy  = document.getElementById('ccyFilter').value;
   const rel  = document.getElementById('relFilter').checked;
+  const up   = document.getElementById('upFilter').checked;
+  const now  = Date.now();
   let visible = 0;
   document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
     const name = tr.querySelector('.name').textContent.toLowerCase();
+    const iso  = tr.querySelector('.rel-time')?.dataset.iso || '';
+    const isUpcoming = iso ? new Date(iso).getTime() > now : false;
     const ok = (!q || name.includes(q)) &&
                (!imp || tr.dataset.importance === imp) &&
                (!ccy || tr.dataset.currency === ccy) &&
-               (!rel || tr.dataset.relevant === '1');
+               (!rel || tr.dataset.relevant === '1') &&
+               (!up  || isUpcoming);
     tr.style.display = ok ? '' : 'none';
     if (ok) visible++;
   }});
@@ -851,7 +1057,8 @@ filterRows();
 # Main
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    news = load_news()
+    # today_only=True → only today's events (Tehran date)
+    news = load_news(today_only=True)
     if not news:
         print("[!] Nothing to export.")
     else:
