@@ -8,6 +8,66 @@ from html import escape
 # --------------------------------------------------------------------
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
 
+# --------------------------------------------------------------------
+# Connected symbols — try MT5 first, fall back to XAUUSD/XAGUSD
+# --------------------------------------------------------------------
+FALLBACK_SYMBOLS = ["XAUUSD", "XAGUSD"]
+
+# Currency codes we recognise inside a symbol name (longest first)
+KNOWN_CCY = [
+    "XAU", "XAG", "XPT", "XPD",         # metals
+    "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
+    "CNH", "CNY", "TRY", "SEK", "NOK", "DKK", "PLN", "HUF",
+    "CZK", "MXN", "ZAR", "SGD", "HKD", "RUB", "INR", "BRL",
+]
+
+
+def get_connected_symbols():
+    """Try to read symbols from MT5. Fall back to FALLBACK_SYMBOLS."""
+    try:
+        import MetaTrader5 as mt5  # pip install MetaTrader5
+        if not mt5.initialize():
+            print(f"[!] MT5 initialize() failed: {mt5.last_error()}")
+            return FALLBACK_SYMBOLS[:]
+        # Symbols visible in Market Watch (these are the "connected" ones)
+        syms = mt5.symbols_get()
+        mt5.shutdown()
+        if not syms:
+            return FALLBACK_SYMBOLS[:]
+        names = sorted({s.name for s in syms})
+        print(f"[✓] MT5 returned {len(names)} symbols.")
+        return names
+    except ImportError:
+        print("[i] MetaTrader5 package not installed — using fallback symbols.")
+        return FALLBACK_SYMBOLS[:]
+    except Exception as ex:
+        print(f"[!] MT5 symbol fetch error: {ex} — using fallback.")
+        return FALLBACK_SYMBOLS[:]
+
+
+def split_symbol(sym):
+    """Return list of currency-like parts found in a symbol name."""
+    s = sym.upper().replace(".", "").replace("_", "").replace("-", "")
+    found = []
+    i = 0
+    while i < len(s):
+        for ccy in KNOWN_CCY:          # sorted longest-first below
+            if s.startswith(ccy, i):
+                found.append(ccy)
+                i += len(ccy)
+                break
+        else:
+            i += 1
+    return found
+
+
+def relevant_currencies(symbols):
+    """Union of all currency codes appearing in the given symbols."""
+    out = set()
+    for sym in symbols:
+        out.update(split_symbol(sym))
+    return out
+
 
 # --------------------------------------------------------------------
 # 1. Free live fetch via biquote — fetches ALL events
@@ -145,7 +205,16 @@ def fmt_value(v, digits=2):
         return escape(str(v))
 
 
-def build_summary(ev):
+def matches_symbols(ev, symbols, relevant_ccys):
+    """Return (is_relevant, matched_symbols)."""
+    ccy = (ev.get("currency") or "").upper()
+    if not ccy or ccy not in relevant_ccys:
+        return False, []
+    matched = [s for s in symbols if ccy in split_symbol(s)]
+    return True, matched
+
+
+def build_summary(ev, symbols=None, relevant_ccys=None):
     """Full news-style narrative paragraph."""
     name    = ev.get("name") or "Event"
     ccy     = ev.get("currency") or ""
@@ -170,14 +239,12 @@ def build_summary(ev):
         except (ValueError, TypeError):
             return str(x)
 
-    # Unit description
     unit_txt = ""
     if unit not in ("none", "", None):
         unit_txt = f" measured in {unit}"
         if mult not in ("none", "", None):
             unit_txt += f" ({mult})"
 
-    # Impact phrase
     impact_phrase = {
         "high":   "a high-impact release that frequently triggers sharp moves in related currency pairs",
         "medium": "a medium-impact release that can cause moderate volatility in related markets",
@@ -186,14 +253,12 @@ def build_summary(ev):
 
     parts = []
 
-    # 1. Intro
     sector_txt = f" in the {sector} sector" if sector else ""
     parts.append(
         f"{name} is {impact_phrase}. "
         f"It is a {ccy} {typ}{sector_txt}, published by {country}{unit_txt}."
     )
 
-    # 2. Numbers
     if n(a) is not None and n(f) is not None:
         try:
             a_f = float(a)
@@ -233,7 +298,6 @@ def build_summary(ev):
             "The event has been scheduled but no forecast or actual values are available yet."
         )
 
-    # 3. Previous context
     if n(p) is not None:
         prev_txt = f"The previous reading was {n(p)}"
         if n(rp) is not None and str(rp) != str(p):
@@ -241,7 +305,19 @@ def build_summary(ev):
         prev_txt += "."
         parts.append(prev_txt)
 
-    # 4. Closing / market note
+    # Symbol relevance note
+    if symbols and relevant_ccys:
+        is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
+        if is_rel:
+            parts.append(
+                f"⚠️ This event directly affects your connected symbols: {', '.join(matched)}."
+            )
+        else:
+            parts.append(
+                f"ℹ️ This event does not directly affect your connected symbols "
+                f"({', '.join(symbols)})."
+            )
+
     if imp == "high":
         parts.append(
             "Traders should be prepared for increased volatility around the release time. "
@@ -258,7 +334,7 @@ def build_summary(ev):
 # --------------------------------------------------------------------
 # 4. HTML row + JSON payload
 # --------------------------------------------------------------------
-def build_row(ev, idx):
+def build_row(ev, idx, symbols, relevant_ccys):
     imp = (ev.get("importance") or "low").lower()
     color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
 
@@ -275,8 +351,14 @@ def build_row(ev, idx):
     except (TypeError, ValueError):
         pass
 
+    is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
+    rel_mark = "✅" if is_rel else "❎"
+    rel_cls  = "yes" if is_rel else "no"
+    rel_title = f"Affects: {', '.join(matched)}" if is_rel else "Not relevant to your symbols"
+
     return f"""
-    <tr class="row" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}">
+    <tr class="row" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}" data-relevant="{1 if is_rel else 0}">
+      <td class="xcol"><span class="xmark {rel_cls}" title="{escape(rel_title)}">{rel_mark}</span></td>
       <td>{escape(str(t))}</td>
       <td><span class="ccy">{escape(str(ev.get('currency','')))}</span></td>
       <td><span class="badge" style="background:{bg};color:{color};border:1px solid {color}">{imp.upper()}</span></td>
@@ -289,14 +371,16 @@ def build_row(ev, idx):
     </tr>"""
 
 
-def build_payload(news):
+def build_payload(news, symbols, relevant_ccys):
     out = []
     for ev in news:
         imp = (ev.get("importance") or "low").lower()
         color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
         text = ev.get("description")
         if not text:
-            text = build_summary(ev)
+            text = build_summary(ev, symbols, relevant_ccys)
+
+        is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
 
         out.append({
             "name":        ev.get("name") or "—",
@@ -324,6 +408,8 @@ def build_payload(news):
             "source":      ev.get("source") or "—",
             "sourceUrl":   ev.get("sourceUrl") or "",
             "text":        text,
+            "relevant":    is_rel,
+            "matchedSyms": matched,
         })
     return out
 
@@ -332,6 +418,12 @@ def build_payload(news):
 # 5. HTML generation
 # --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
+    # --- symbol detection ---
+    symbols = get_connected_symbols()
+    relevant_ccys = relevant_currencies(symbols)
+    print(f"[i] Connected symbols: {', '.join(symbols)}")
+    print(f"[i] Relevant currencies: {', '.join(sorted(relevant_ccys))}")
+
     def sort_key(e):
         t = e.get("time") or ""
         try:
@@ -343,17 +435,23 @@ def generate_html(news, output="news_report.html"):
             return datetime.max.replace(tzinfo=timezone.utc)
 
     news = sorted(news, key=sort_key)
-    rows = "\n".join(build_row(e, i) for i, e in enumerate(news))
-    payload_json = json.dumps(build_payload(news), ensure_ascii=False)
+    rows = "\n".join(build_row(e, i, symbols, relevant_ccys) for i, e in enumerate(news))
+    payload_json = json.dumps(build_payload(news, symbols, relevant_ccys), ensure_ascii=False)
 
     generated_at = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M Tehran")
     total = len(news)
     highs   = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
     lows    = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
+    relevant_count = sum(
+        1 for e in news if matches_symbols(e, symbols, relevant_ccys)[0]
+    )
 
     currencies = sorted({str(e.get("currency", "")) for e in news if e.get("currency")})
     ccy_options = "".join(f'<option value="{c}">{c}</option>' for c in currencies)
+
+    symbols_str = ", ".join(symbols)
+    rel_ccy_str = ", ".join(sorted(relevant_ccys))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -376,6 +474,16 @@ def generate_html(news, output="news_report.html"):
   }}
   h1 {{ font-size: 22px; margin: 0; }}
   .meta {{ color: var(--muted); font-size: 13px; }}
+  .symbols-bar {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;
+    font-size: 13px; display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center;
+  }}
+  .symbols-bar .lbl {{ color: var(--muted); }}
+  .symbols-bar code {{
+    background: #0b1220; border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 4px; font-size: 12px; color: var(--accent);
+  }}
   .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }}
   .stat {{
     background: var(--panel); border: 1px solid var(--border);
@@ -386,12 +494,19 @@ def generate_html(news, output="news_report.html"):
   .stat.high .num {{ color: #e53935; }}
   .stat.medium .num {{ color: #fb8c00; }}
   .stat.low .num {{ color: #43a047; }}
-  .controls {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }}
+  .stat.rel .num {{ color: #38bdf8; }}
+  .controls {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }}
   input, select {{
     background: var(--panel); border: 1px solid var(--border);
     color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px;
   }}
   input:focus, select:focus {{ outline: none; border-color: var(--accent); }}
+  .chk-label {{
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }}
+  .chk-label input {{ margin: 0; cursor: pointer; }}
   table {{
     width: 100%; border-collapse: collapse; background: var(--panel);
     border-radius: 10px; overflow: hidden; font-size: 13px;
@@ -413,6 +528,10 @@ def generate_html(news, output="news_report.html"):
     display: inline-block; padding: 2px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 700; letter-spacing: .04em;
   }}
+  .xcol {{ text-align: center; width: 40px; }}
+  .xmark {{ font-size: 16px; display: inline-block; line-height: 1; }}
+  .xmark.yes {{ filter: drop-shadow(0 0 4px rgba(74,222,128,.5)); }}
+  .xmark.no  {{ opacity: .55; }}
   footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; }}
 
   /* ---------- Modal / Card ---------- */
@@ -446,6 +565,17 @@ def generate_html(news, output="news_report.html"):
   }}
   .close:hover {{ color: var(--text); border-color: var(--accent); }}
   .card-body {{ padding: 18px 22px 22px; }}
+
+  .rel-banner {{
+    padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+    font-size: 13px; font-weight: 600;
+  }}
+  .rel-banner.yes {{
+    background: rgba(74,222,128,.1); border: 1px solid rgba(74,222,128,.4); color: #86efac;
+  }}
+  .rel-banner.no {{
+    background: rgba(148,163,184,.1); border: 1px solid rgba(148,163,184,.3); color: var(--muted);
+  }}
 
   .grid {{
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -496,10 +626,18 @@ def generate_html(news, output="news_report.html"):
     <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events &nbsp;•&nbsp; Click any row for details</div>
   </header>
 
+  <div class="symbols-bar">
+    <span class="lbl">🔌 Connected symbols:</span>
+    <span>{escape(symbols_str)}</span>
+    <span class="lbl">·&nbsp; Relevant currencies:</span>
+    <span>{escape(rel_ccy_str)}</span>
+  </div>
+
   <div class="stats">
     <div class="stat high"><div class="num">{highs}</div><div class="lbl">High</div></div>
     <div class="stat medium"><div class="num">{mediums}</div><div class="lbl">Medium</div></div>
     <div class="stat low"><div class="num">{lows}</div><div class="lbl">Low</div></div>
+    <div class="stat rel"><div class="num">{relevant_count}</div><div class="lbl">Relevant</div></div>
     <div class="stat"><div class="num">{total}</div><div class="lbl">Total</div></div>
   </div>
 
@@ -515,12 +653,17 @@ def generate_html(news, output="news_report.html"):
       <option value="">All currencies</option>
       {ccy_options}
     </select>
+    <label class="chk-label">
+      <input type="checkbox" id="relFilter" onchange="filterRows()">
+      ✅ Only relevant to my symbols
+    </label>
     <span id="visibleCount" class="meta" style="align-self:center"></span>
   </div>
 
   <table id="newsTable">
     <thead>
       <tr>
+        <th class="xcol" title="Relevance to your connected symbols">X</th>
         <th>Time (Tehran)</th><th>CCY</th><th>Impact</th><th>Event</th>
         <th style="text-align:right">Actual</th>
         <th style="text-align:right">Forecast</th>
@@ -546,6 +689,7 @@ def generate_html(news, output="news_report.html"):
         <button class="close" onclick="closeCard()">✕ Close</button>
       </div>
       <div class="card-body">
+        <div class="rel-banner" id="c-rel">—</div>
         <div class="grid" id="c-grid"></div>
 
         <div class="news-text">
@@ -572,6 +716,16 @@ function openCard(idx) {{
   document.getElementById('c-name').textContent = n.name;
   document.getElementById('c-sub').innerHTML =
     `<span class="ccy">${{n.currency}}</span> &nbsp;•&nbsp; ${{n.country}} &nbsp;•&nbsp; ${{n.importance.toUpperCase()}} impact &nbsp;•&nbsp; ${{n.type}}`;
+
+  // Relevance banner
+  const rel = document.getElementById('c-rel');
+  if (n.relevant) {{
+    rel.className = 'rel-banner yes';
+    rel.textContent = `✅ Affects your connected symbols: ${{n.matchedSyms.join(', ')}}`;
+  }} else {{
+    rel.className = 'rel-banner no';
+    rel.textContent = '❎ Does not affect your connected symbols';
+  }}
 
   let aCls = "";
   const a = parseFloat(n.actual), f = parseFloat(n.forecast);
@@ -625,15 +779,17 @@ document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
 
 // Filtering
 function filterRows() {{
-  const q   = document.getElementById('search').value.toLowerCase();
-  const imp = document.getElementById('impFilter').value;
-  const ccy = document.getElementById('ccyFilter').value;
+  const q    = document.getElementById('search').value.toLowerCase();
+  const imp  = document.getElementById('impFilter').value;
+  const ccy  = document.getElementById('ccyFilter').value;
+  const rel  = document.getElementById('relFilter').checked;
   let visible = 0;
   document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
     const name = tr.querySelector('.name').textContent.toLowerCase();
     const ok = (!q || name.includes(q)) &&
                (!imp || tr.dataset.importance === imp) &&
-               (!ccy || tr.dataset.currency === ccy);
+               (!ccy || tr.dataset.currency === ccy) &&
+               (!rel || tr.dataset.relevant === '1');
     tr.style.display = ok ? '' : 'none';
     if (ok) visible++;
   }});
@@ -647,8 +803,7 @@ filterRows();
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"[✓] HTML report written → {os.path.abspath(output)}")
-    print(f"[i] Breakdown — High: {highs} | Medium: {mediums} | Low: {lows} | Total: {total}")
-    print(f"[i] Times shown in Tehran time (UTC+3:30)")
+    print(f"[i] Breakdown — High: {highs} | Medium: {mediums} | Low: {lows} | Relevant: {relevant_count} | Total: {total}")
 
 
 # --------------------------------------------------------------------
