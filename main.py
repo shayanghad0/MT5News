@@ -4,71 +4,88 @@ from datetime import datetime
 from html import escape
 
 # --------------------------------------------------------------------
-# 1. OPTIONAL: Free live fetch (no API key). Comment out if not needed.
+# 1. Free live fetch via biquote (no API key required)
 #    pip install biquote
 # --------------------------------------------------------------------
+def _get(obj, *names, default=None):
+    """Try multiple attribute/key names on an object or dict."""
+    for n in names:
+        if isinstance(obj, dict) and n in obj and obj[n] not in (None, ""):
+            return obj[n]
+        if hasattr(obj, n):
+            v = getattr(obj, n)
+            if v not in (None, ""):
+                return v
+    return default
+
 def fetch_free_news():
     try:
         from biquote import Biquote
         bq = Biquote()
-        # High-impact events for the week
         events = bq.calendar(importance="high")
-        # Convert biquote events into the MQL5-style dict format
+        print(f"[i] biquote returned {len(events)} raw events.")
+        if events:
+            # 🔍 Diagnostic: show the real fields of the first event
+            sample = events[0]
+            fields = sample.keys() if isinstance(sample, dict) else vars(sample)
+            print(f"[i] Sample biquote fields: {list(fields)}")
+            print(f"[i] Sample biquote object: {sample}")
+
         converted = []
         for e in events:
             converted.append({
-                'id':            f"bq:{getattr(e, 'id', '')}",
-                'eventId':       getattr(e, 'event_id', ''),
-                'time':          str(getattr(e, 'date', '')),
-                'period':        None,
-                'countryCode':   getattr(e, 'country', ''),
-                'currency':      getattr(e, 'currency', ''),
-                'name':          getattr(e, 'name', ''),
-                'importance':    getattr(e, 'importance', 'medium'),
-                'type':          'event',
-                'sector':        getattr(e, 'category', ''),
-                'unit':          'none',
-                'multiplier':    'none',
-                'digits':        2,
-                'actual':        getattr(e, 'actual', None),
-                'forecast':      getattr(e, 'forecast', None),
-                'previous':      getattr(e, 'previous', None),
-                'revisedPrevious': None,
-                'revision':      0,
-                'timeMode':      'exact',
-                'sourceUrl':     '',
-                'source':        'biquote',
+                'id':             str(_get(e, 'id', 'event_id', 'eventId', default='')),
+                'eventId':        str(_get(e, 'event_id', 'eventId', 'id', default='')),
+                'time':           str(_get(e, 'date', 'datetime', 'time', 'timestamp', default='')),
+                'period':         _get(e, 'period'),
+                'countryCode':    _get(e, 'country', 'country_code', 'countryCode', default=''),
+                'currency':       _get(e, 'currency', 'currency_code', 'ccy', default=''),
+                'name':           _get(e, 'name', 'title', 'event', 'event_name', default=''),
+                'importance':     str(_get(e, 'importance', 'impact', 'priority', default='medium')).lower(),
+                'type':           _get(e, 'type', default='event'),
+                'sector':         _get(e, 'sector', 'category', default=''),
+                'unit':           _get(e, 'unit', default='none'),
+                'multiplier':     _get(e, 'multiplier', default='none'),
+                'digits':         _get(e, 'digits', default=2) or 2,
+                'actual':         _get(e, 'actual'),
+                'forecast':       _get(e, 'forecast'),
+                'previous':       _get(e, 'previous'),
+                'revisedPrevious': _get(e, 'revisedPrevious'),
+                'revision':       _get(e, 'revision', default=0),
+                'timeMode':       _get(e, 'timeMode', default='exact'),
+                'sourceUrl':      _get(e, 'sourceUrl', 'url', default=''),
+                'source':         'biquote',
             })
         return converted
     except Exception as ex:
-        print(f"[!] biquote fetch failed ({ex}). Falling back to local data.")
+        print(f"[!] biquote fetch failed: {ex}")
         return None
 
 
 # --------------------------------------------------------------------
-# 2. Load data — from live fetch, a JSON file, or an inline list.
-#    Replace `LOCAL_NEWS` with your exported list if you don't want
-#    to use biquote at all.
+# 2. Data loading: news.json → biquote → inline list
 # --------------------------------------------------------------------
-LOCAL_NEWS = [
-    # 👇 Paste your exported MQL5 events here (as dicts) — the format you showed
-]
+LOCAL_NEWS = []   # optional fallback
 
 def load_news():
-    # Try live fetch first
+    # Priority 1: your exported MQL5 data (perfect format, guaranteed)
+    if os.path.exists("news.json"):
+        try:
+            with open("news.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and data:
+                print(f"[✓] Loaded {len(data)} events from news.json (MQL5 format).")
+                return data
+        except Exception as ex:
+            print(f"[!] news.json parse error: {ex}")
+
+    # Priority 2: free live fetch
     data = fetch_free_news()
     if data:
-        print(f"[✓] Fetched {len(data)} events from biquote.")
+        print(f"[✓] Using {len(data)} events from biquote.")
         return data
 
-    # Fall back to local JSON file
-    if os.path.exists("news.json"):
-        with open("news.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        print(f"[✓] Loaded {len(data)} events from news.json.")
-        return data
-
-    # Fall back to inline list
+    # Priority 3: inline list
     if LOCAL_NEWS:
         print(f"[✓] Using {len(LOCAL_NEWS)} inline events.")
         return LOCAL_NEWS
@@ -90,7 +107,7 @@ def fmt_value(v, digits=2):
     if v is None or v == "":
         return "—"
     try:
-        return f"{float(v):.{digits}f}"
+        return f"{float(v):.{int(digits)}f}"
     except (ValueError, TypeError):
         return escape(str(v))
 
@@ -101,7 +118,7 @@ def build_row(ev):
     t = ev.get("time") or ""
     if t:
         try:
-            dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
             t = dt.strftime("%Y-%m-%d %H:%M UTC")
         except Exception:
             pass
@@ -111,7 +128,6 @@ def build_row(ev):
     forecast = fmt_value(ev.get("forecast"), digits)
     previous = fmt_value(ev.get("previous"), digits)
 
-    # Highlight actual vs forecast
     actual_cls = ""
     try:
         a, f = float(ev.get("actual")), float(ev.get("forecast"))
@@ -120,16 +136,16 @@ def build_row(ev):
         pass
 
     return f"""
-    <tr data-importance="{imp}" data-currency="{escape(ev.get('currency',''))}">
-      <td>{escape(t)}</td>
-      <td><span class="ccy">{escape(ev.get('currency',''))}</span></td>
+    <tr data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}">
+      <td>{escape(str(t))}</td>
+      <td><span class="ccy">{escape(str(ev.get('currency','')))}</span></td>
       <td><span class="badge" style="background:{bg};color:{color};border:1px solid {color}">{imp.upper()}</span></td>
-      <td class="name">{escape(ev.get('name',''))}</td>
+      <td class="name">{escape(str(ev.get('name','')))}</td>
       <td class="num {actual_cls}">{actual}</td>
       <td class="num">{forecast}</td>
       <td class="num">{previous}</td>
-      <td>{escape(ev.get('sector') or '—')}</td>
-      <td>{escape(ev.get('source') or '—')}</td>
+      <td>{escape(str(ev.get('sector') or '—'))}</td>
+      <td>{escape(str(ev.get('source') or '—'))}</td>
     </tr>"""
 
 
@@ -137,6 +153,8 @@ def generate_html(news, output="news_report.html"):
     rows = "\n".join(build_row(e) for e in news)
     generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     total = len(news)
+    currencies = sorted({str(e.get("currency","")) for e in news if e.get("currency")})
+    ccy_options = "".join(f'<option value="{c}">{c}</option>' for c in currencies)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -159,9 +177,7 @@ def generate_html(news, output="news_report.html"):
   }}
   h1 {{ font-size: 22px; margin: 0; }}
   .meta {{ color: var(--muted); font-size: 13px; }}
-  .controls {{
-    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;
-  }}
+  .controls {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }}
   input, select {{
     background: var(--panel); border: 1px solid var(--border);
     color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px;
@@ -171,12 +187,8 @@ def generate_html(news, output="news_report.html"):
     width: 100%; border-collapse: collapse; background: var(--panel);
     border-radius: 10px; overflow: hidden; font-size: 13px;
   }}
-  thead {{
-    background: #0b1220; position: sticky; top: 0;
-  }}
-  th, td {{
-    padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);
-  }}
+  thead {{ background: #0b1220; position: sticky; top: 0; }}
+  th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
   th {{ color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
   tr:hover td {{ background: rgba(56,189,248,.05); }}
   .name {{ font-weight: 500; }}
@@ -217,7 +229,7 @@ def generate_html(news, output="news_report.html"):
     </select>
     <select id="ccyFilter" onchange="filterRows()">
       <option value="">All currencies</option>
-      {''.join(f'<option value="{c}">{c}</option>' for c in sorted({e.get("currency","") for e in news if e.get("currency")}))}
+      {ccy_options}
     </select>
   </div>
 
@@ -245,11 +257,9 @@ function filterRows() {{
   const ccy = document.getElementById('ccyFilter').value;
   document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
     const name = tr.querySelector('.name').textContent.toLowerCase();
-    const trImp = tr.dataset.importance;
-    const trCcy = tr.dataset.currency;
     const ok = (!q || name.includes(q)) &&
-               (!imp || trImp === imp) &&
-               (!ccy || trCcy === ccy);
+               (!imp || tr.dataset.importance === imp) &&
+               (!ccy || tr.dataset.currency === ccy);
     tr.style.display = ok ? '' : 'none';
   }});
 }}
@@ -262,12 +272,9 @@ function filterRows() {{
     print(f"[✓] HTML report written → {os.path.abspath(output)}")
 
 
-# --------------------------------------------------------------------
-# 4. Main
-# --------------------------------------------------------------------
 if __name__ == "__main__":
     news = load_news()
     if not news:
-        print("[!] Nothing to export. Paste your MQL5 events into LOCAL_NEWS or save as news.json.")
+        print("[!] Nothing to export.")
     else:
         generate_html(news, output="news_report.html")
