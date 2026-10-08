@@ -251,7 +251,7 @@ def matches_symbols(ev, symbols, relevant_ccys):
 
 
 # --------------------------------------------------------------------
-# 3b. Trade advice engine — NO WAIT signals
+# 3b. Trade advice engine — NO WAIT / NO TRADE rows
 # --------------------------------------------------------------------
 def build_trade_advice(ev, matched_syms):
     name  = ev.get("name") or "Event"
@@ -272,7 +272,6 @@ def build_trade_advice(ev, matched_syms):
 
     a_f, f_f, p_f = num(a), num(f), num(p)
 
-    # Determine scenario
     if a_f is None and f_f is not None:
         scenario = "pre"
     elif a_f is not None and f_f is not None:
@@ -287,26 +286,24 @@ def build_trade_advice(ev, matched_syms):
     def direction_for_symbol(sym, base_strength):
         parts = split_symbol(sym)
         if len(parts) < 2:
-            return "NO TRADE", "flat"
+            return None, None
         base, quote = parts[0], parts[1]
         if base_strength == 0:
-            return "NO TRADE", "flat"
+            return None, None
         if ccy == base:
             signal = "BUY" if base_strength > 0 else "SELL"
         elif ccy == quote:
             signal = "SELL" if base_strength > 0 else "BUY"
         else:
-            return "NO TRADE", "flat"
+            return None, None
         cls = "buy" if signal == "BUY" else "sell"
         return signal, cls
 
-    # Base currency strength per scenario
     strength = 0
     reason_prefix = ""
     headline = ""
 
     if scenario == "pre":
-        # Compare forecast vs previous to get directional bias
         if f_f is not None and p_f is not None:
             if f_f > p_f:
                 strength = +1
@@ -349,9 +346,12 @@ def build_trade_advice(ev, matched_syms):
     conf_map = {"high": "High", "medium": "Medium", "low": "Low"}
     confidence = conf_map.get(imp, "Low")
 
+    # ✅ Only keep BUY / SELL rows — skip NO TRADE
     rows = []
     for sym in matched_syms:
         sig, cls = direction_for_symbol(sym, strength)
+        if sig is None:
+            continue
         rows.append({
             "symbol": sym,
             "signal": sig,
@@ -380,32 +380,33 @@ def build_trade_advice(ev, matched_syms):
 def render_trade_advice_html(advice):
     if not advice:
         return ""
+    # ✅ If no valid BUY/SELL signals, don't render the block at all
+    if not advice.get("rows"):
+        return ""
+
     html_parts = []
     html_parts.append(f'<div class="advice-headline">{advice["headline"]}</div>')
 
     if advice.get("hint"):
         html_parts.append(f'<div class="advice-hint">{advice["hint"]}</div>')
 
-    if advice["rows"]:
-        rows_html = ""
-        for r in advice["rows"]:
-            sig = r["signal"]
-            if sig == "BUY":
-                badge = '<span class="sig sig-buy">🟢 BUY</span>'
-            elif sig == "SELL":
-                badge = '<span class="sig sig-sell">🔴 SELL</span>'
-            else:
-                badge = '<span class="sig sig-flat">⚪ NO TRADE</span>'
-            rows_html += (
-                f'<tr><td class="adv-sym">{escape(r["symbol"])}</td>'
-                f'<td class="adv-sig">{badge}</td>'
-                f'<td class="adv-reason">{escape(r["reason"])}</td></tr>'
-            )
-        html_parts.append(
-            '<table class="advice-table"><thead><tr>'
-            '<th>Symbol</th><th>Signal</th><th>Reason</th>'
-            '</tr></thead><tbody>' + rows_html + '</tbody></table>'
+    rows_html = ""
+    for r in advice["rows"]:
+        sig = r["signal"]
+        if sig == "BUY":
+            badge = '<span class="sig sig-buy">🟢 BUY</span>'
+        else:  # SELL
+            badge = '<span class="sig sig-sell">🔴 SELL</span>'
+        rows_html += (
+            f'<tr><td class="adv-sym">{escape(r["symbol"])}</td>'
+            f'<td class="adv-sig">{badge}</td>'
+            f'<td class="adv-reason">{escape(r["reason"])}</td></tr>'
         )
+    html_parts.append(
+        '<table class="advice-table"><thead><tr>'
+        '<th>Symbol</th><th>Signal</th><th>Reason</th>'
+        '</tr></thead><tbody>' + rows_html + '</tbody></table>'
+    )
 
     html_parts.append(
         f'<div class="advice-confidence">Confidence: <b>{advice["confidence"]}</b></div>'
@@ -815,7 +816,6 @@ def generate_html(news, output="news_report.html"):
   .sig {{ font-weight: 700; padding: 2px 8px; border-radius: 6px; font-size: 12px; }}
   .sig-buy  {{ background: rgba(74,222,128,.15); color: var(--buy); }}
   .sig-sell {{ background: rgba(248,113,113,.15); color: var(--sell); }}
-  .sig-flat {{ background: rgba(148,163,184,.15); color: var(--muted); }}
   .adv-reason {{ color: var(--muted); font-size: 12px; }}
   .advice-confidence {{ font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }}
   .advice-note {{ font-size: 12px; color: #cbd5e1; margin-bottom: 8px;
