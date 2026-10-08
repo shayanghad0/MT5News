@@ -8,9 +8,6 @@ from html import escape
 # --------------------------------------------------------------------
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
 
-# --------------------------------------------------------------------
-# Connected symbols — try MT5 first, fall back to XAUUSD/XAGUSD
-# --------------------------------------------------------------------
 FALLBACK_SYMBOLS = ["XAUUSD", "XAGUSD"]
 
 KNOWN_CCY = [
@@ -64,9 +61,6 @@ def relevant_currencies(symbols):
     return out
 
 
-# --------------------------------------------------------------------
-# 1. Free live fetch via biquote — TODAY only
-# --------------------------------------------------------------------
 def _get(obj, *names, default=None):
     for n in names:
         if isinstance(obj, dict) and n in obj and obj[n] not in (None, ""):
@@ -154,9 +148,6 @@ def fetch_free_news(today_only=True):
         return None
 
 
-# --------------------------------------------------------------------
-# 2. Data loading
-# --------------------------------------------------------------------
 LOCAL_NEWS = []
 
 
@@ -199,9 +190,6 @@ def load_news(today_only=True):
     return []
 
 
-# --------------------------------------------------------------------
-# 3. Helpers
-# --------------------------------------------------------------------
 IMPORTANCE_COLORS = {
     "high":    ("#e53935", "#ffebee"),
     "medium":  ("#fb8c00", "#fff3e0"),
@@ -263,13 +251,9 @@ def matches_symbols(ev, symbols, relevant_ccys):
 
 
 # --------------------------------------------------------------------
-# 3b. Trade advice engine
+# 3b. Trade advice engine — NO WAIT signals
 # --------------------------------------------------------------------
 def build_trade_advice(ev, matched_syms):
-    """
-    Pre-release analysis with buy/sell recommendation for each matched symbol.
-    Returns a dict with: scenario, headline, advice_rows, note.
-    """
     name  = ev.get("name") or "Event"
     ccy   = (ev.get("currency") or "").upper()
     imp   = (ev.get("importance") or "low").lower()
@@ -288,9 +272,9 @@ def build_trade_advice(ev, matched_syms):
 
     a_f, f_f, p_f = num(a), num(f), num(p)
 
-    # Which scenario are we in?
+    # Determine scenario
     if a_f is None and f_f is not None:
-        scenario = "pre"      # not released yet
+        scenario = "pre"
     elif a_f is not None and f_f is not None:
         if a_f > f_f:      scenario = "beat"
         elif a_f < f_f:    scenario = "miss"
@@ -300,94 +284,81 @@ def build_trade_advice(ev, matched_syms):
     else:
         scenario = "unknown"
 
-    # Base currency = the event's currency (e.g., ZAR)
-    # For XXXCCY pairs (e.g., USDZAR), a strong ZAR → pair falls (SELL)
-    # For CCYXXX pairs (e.g., ZARJPY), a strong ZAR → pair rises (BUY)
     def direction_for_symbol(sym, base_strength):
-        """
-        base_strength: +1 = base currency strengthens
-                       -1 = base currency weakens
-                        0 = unclear
-        """
         parts = split_symbol(sym)
         if len(parts) < 2:
-            return "—", "—"
+            return "NO TRADE", "flat"
         base, quote = parts[0], parts[1]
-
         if base_strength == 0:
             return "NO TRADE", "flat"
-
-        # Is the event's currency the base or quote?
         if ccy == base:
-            # CCY is base → CCY strengthens → pair UP
             signal = "BUY" if base_strength > 0 else "SELL"
         elif ccy == quote:
-            # CCY is quote → CCY strengthens → pair DOWN
             signal = "SELL" if base_strength > 0 else "BUY"
         else:
             return "NO TRADE", "flat"
-
         cls = "buy" if signal == "BUY" else "sell"
         return signal, cls
 
-    # Scenario → base currency strength
-    strength_map = {
-        "beat":     +1,   # higher than forecast → base currency stronger
-        "miss":     -1,   # lower than forecast  → base currency weaker
-        "inline":    0,
-        "released":  0,
-        "pre":       0,
-        "unknown":   0,
-    }
+    # Base currency strength per scenario
+    strength = 0
+    reason_prefix = ""
+    headline = ""
 
-    # Pre-release: use forecast vs previous to hint at likely direction
-    hint_txt = ""
     if scenario == "pre":
+        # Compare forecast vs previous to get directional bias
         if f_f is not None and p_f is not None:
             if f_f > p_f:
-                hint_txt = f"Forecast is above previous ({f_f} vs {p_f}) — mild positive bias."
-                strength_map["pre"] = +0.5
+                strength = +1
+                reason_prefix = "Forecast > previous — base biased stronger"
+                headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} > "
+                            f"Previous {fmt_value(p, digits)} → {ccy} bias STRONGER")
             elif f_f < p_f:
-                hint_txt = f"Forecast is below previous ({f_f} vs {p_f}) — mild negative bias."
-                strength_map["pre"] = -0.5
+                strength = -1
+                reason_prefix = "Forecast < previous — base biased weaker"
+                headline = (f"🔮 PREDICTED — Forecast {fmt_value(f, digits)} < "
+                            f"Previous {fmt_value(p, digits)} → {ccy} bias WEAKER")
             else:
-                hint_txt = "Forecast matches previous — neutral bias."
+                strength = 0
+                reason_prefix = "Forecast = previous — no clear bias"
+                headline = (f"🔮 PREDICTED — Forecast matches Previous "
+                            f"({fmt_value(f, digits)}) → no directional edge")
         else:
-            hint_txt = "Not enough data to bias direction. Wait for release."
+            strength = 0
+            reason_prefix = "No forecast data — no clear bias"
+            headline = "🔮 PREDICTED — no forecast available"
+    elif scenario == "beat":
+        strength = +1
+        reason_prefix = "Beat forecast — base strengthens"
+        headline = (f"📈 BEAT — Actual {fmt_value(a, digits)} > "
+                    f"Forecast {fmt_value(f, digits)}")
+    elif scenario == "miss":
+        strength = -1
+        reason_prefix = "Missed forecast — base weakens"
+        headline = (f"📉 MISS — Actual {fmt_value(a, digits)} < "
+                    f"Forecast {fmt_value(f, digits)}")
+    elif scenario == "inline":
+        strength = 0
+        reason_prefix = "In-line with forecast — no directional edge"
+        headline = f"➖ IN-LINE — Actual = Forecast ({fmt_value(a, digits)})"
+    else:
+        strength = 0
+        reason_prefix = "No forecast to compare"
+        headline = "ℹ️ Released — no forecast to compare"
 
-    # Confidence based on impact level
     conf_map = {"high": "High", "medium": "Medium", "low": "Low"}
     confidence = conf_map.get(imp, "Low")
 
-    # Build per-symbol advice rows
     rows = []
     for sym in matched_syms:
-        if scenario == "pre":
-            sig, cls = "WAIT", "wait"
-            reason = "Pre-release — wait for actual figure."
-        else:
-            sig, cls = direction_for_symbol(sym, strength_map.get(scenario, 0))
-            if sig == "NO TRADE":
-                reason = "In-line / unclear — stay flat."
-            else:
-                reason = "Beat → base strengthens" if scenario == "beat" else \
-                         "Miss → base weakens" if scenario == "miss" else \
-                         "In-line — no clear edge."
-        rows.append({"symbol": sym, "signal": sig, "cls": cls, "reason": reason})
+        sig, cls = direction_for_symbol(sym, strength)
+        rows.append({
+            "symbol": sym,
+            "signal": sig,
+            "cls": cls,
+            "reason": reason_prefix,
+        })
 
-    # Scenario headline
-    if scenario == "pre":
-        headline = f"⏳ PRE-RELEASE — {name} ({ccy}) not yet published"
-    elif scenario == "beat":
-        headline = f"📈 BEAT — Actual {fmt_value(a, digits)} > Forecast {fmt_value(f, digits)}"
-    elif scenario == "miss":
-        headline = f"📉 MISS — Actual {fmt_value(a, digits)} < Forecast {fmt_value(f, digits)}"
-    elif scenario == "inline":
-        headline = f"➖ IN-LINE — Actual = Forecast ({fmt_value(a, digits)})"
-    else:
-        headline = "ℹ️ Released — no forecast to compare"
-
-    # Risk note based on impact
     if imp == "high":
         note = "⚠️ HIGH-impact event — volatility likely. Use tight stops, max 1% risk per trade."
     elif imp == "medium":
@@ -400,33 +371,29 @@ def build_trade_advice(ev, matched_syms):
         "headline":  headline,
         "rows":      rows,
         "confidence": confidence,
-        "hint":      hint_txt,
+        "hint":      "",
         "note":      note,
         "impact":    imp,
     }
 
 
 def render_trade_advice_html(advice):
-    """Render trade advice into HTML for the card."""
     if not advice:
         return ""
     html_parts = []
     html_parts.append(f'<div class="advice-headline">{advice["headline"]}</div>')
 
-    if advice["hint"]:
+    if advice.get("hint"):
         html_parts.append(f'<div class="advice-hint">{advice["hint"]}</div>')
 
     if advice["rows"]:
         rows_html = ""
         for r in advice["rows"]:
             sig = r["signal"]
-            cls = r["cls"]
             if sig == "BUY":
                 badge = '<span class="sig sig-buy">🟢 BUY</span>'
             elif sig == "SELL":
                 badge = '<span class="sig sig-sell">🔴 SELL</span>'
-            elif sig == "WAIT":
-                badge = '<span class="sig sig-wait">⏳ WAIT</span>'
             else:
                 badge = '<span class="sig sig-flat">⚪ NO TRADE</span>'
             rows_html += (
@@ -452,7 +419,6 @@ def render_trade_advice_html(advice):
 
 
 def build_summary(ev, symbols=None, relevant_ccys=None):
-    """Full news-style narrative paragraph (kept as-is)."""
     name    = ev.get("name") or "Event"
     ccy     = ev.get("currency") or ""
     country = ev.get("countryCode") or ""
@@ -544,9 +510,6 @@ def build_summary(ev, symbols=None, relevant_ccys=None):
     return " ".join(parts)
 
 
-# --------------------------------------------------------------------
-# 4. HTML row + JSON payload
-# --------------------------------------------------------------------
 def build_row(ev, idx, symbols, relevant_ccys):
     imp = (ev.get("importance") or "low").lower()
     color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
@@ -603,7 +566,6 @@ def build_payload(news, symbols, relevant_ccys):
 
         is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
 
-        # Trade advice only for relevant events
         advice_html = ""
         if is_rel and matched:
             advice = build_trade_advice(ev, matched)
@@ -643,9 +605,6 @@ def build_payload(news, symbols, relevant_ccys):
     return out
 
 
-# --------------------------------------------------------------------
-# 5. HTML generation
-# --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
     symbols = get_connected_symbols()
     relevant_ccys = relevant_currencies(symbols)
@@ -839,7 +798,6 @@ def generate_html(news, output="news_report.html"):
     text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }}
   .news-text .body {{ line-height: 1.7; font-size: 14px; color: #cbd5e1; }}
 
-  /* Trade advice */
   .advice {{ margin-top: 14px; background: linear-gradient(135deg, #0b1220 0%, #1a2739 100%);
     border: 1px solid var(--border); border-left: 3px solid var(--wait);
     border-radius: 10px; padding: 14px 16px; }}
@@ -857,7 +815,6 @@ def generate_html(news, output="news_report.html"):
   .sig {{ font-weight: 700; padding: 2px 8px; border-radius: 6px; font-size: 12px; }}
   .sig-buy  {{ background: rgba(74,222,128,.15); color: var(--buy); }}
   .sig-sell {{ background: rgba(248,113,113,.15); color: var(--sell); }}
-  .sig-wait {{ background: rgba(251,191,36,.15); color: var(--wait); }}
   .sig-flat {{ background: rgba(148,163,184,.15); color: var(--muted); }}
   .adv-reason {{ color: var(--muted); font-size: 12px; }}
   .advice-confidence {{ font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }}
@@ -1122,7 +1079,6 @@ function openCard(idx) {{
   document.getElementById('c-grid').innerHTML = grid;
   document.getElementById('c-text').textContent = n.text;
 
-  // Trade advice block
   const advWrap = document.getElementById('c-advice');
   const advBody = document.getElementById('c-advice-body');
   if (n.adviceHtml) {{
@@ -1187,9 +1143,6 @@ filterRows();
     print(f"[i] Breakdown — High: {highs} | Medium: {mediums} | Low: {lows} | Relevant: {relevant_count} | Total: {total}")
 
 
-# --------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------
 if __name__ == "__main__":
     news = load_news(today_only=True)
     if not news:
