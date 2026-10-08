@@ -13,7 +13,6 @@ TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
 # --------------------------------------------------------------------
 FALLBACK_SYMBOLS = ["XAUUSD", "XAGUSD"]
 
-# Currency codes we recognise inside a symbol name (longest first)
 KNOWN_CCY = [
     "XAU", "XAG", "XPT", "XPD",         # metals
     "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
@@ -23,13 +22,11 @@ KNOWN_CCY = [
 
 
 def get_connected_symbols():
-    """Try to read symbols from MT5. Fall back to FALLBACK_SYMBOLS."""
     try:
-        import MetaTrader5 as mt5  # pip install MetaTrader5
+        import MetaTrader5 as mt5
         if not mt5.initialize():
             print(f"[!] MT5 initialize() failed: {mt5.last_error()}")
             return FALLBACK_SYMBOLS[:]
-        # Symbols visible in Market Watch (these are the "connected" ones)
         syms = mt5.symbols_get()
         mt5.shutdown()
         if not syms:
@@ -46,12 +43,11 @@ def get_connected_symbols():
 
 
 def split_symbol(sym):
-    """Return list of currency-like parts found in a symbol name."""
     s = sym.upper().replace(".", "").replace("_", "").replace("-", "")
     found = []
     i = 0
     while i < len(s):
-        for ccy in KNOWN_CCY:          # sorted longest-first below
+        for ccy in KNOWN_CCY:
             if s.startswith(ccy, i):
                 found.append(ccy)
                 i += len(ccy)
@@ -62,7 +58,6 @@ def split_symbol(sym):
 
 
 def relevant_currencies(symbols):
-    """Union of all currency codes appearing in the given symbols."""
     out = set()
     for sym in symbols:
         out.update(split_symbol(sym))
@@ -71,7 +66,6 @@ def relevant_currencies(symbols):
 
 # --------------------------------------------------------------------
 # 1. Free live fetch via biquote — fetches ALL events
-#    pip install biquote
 # --------------------------------------------------------------------
 def _get(obj, *names, default=None):
     for n in names:
@@ -88,7 +82,7 @@ def fetch_free_news():
     try:
         from biquote import Biquote
         bq = Biquote()
-        events = bq.calendar()   # ALL news
+        events = bq.calendar()
 
         print(f"[i] biquote returned {len(events)} raw events (ALL importance).")
         if events:
@@ -206,7 +200,6 @@ def fmt_value(v, digits=2):
 
 
 def matches_symbols(ev, symbols, relevant_ccys):
-    """Return (is_relevant, matched_symbols)."""
     ccy = (ev.get("currency") or "").upper()
     if not ccy or ccy not in relevant_ccys:
         return False, []
@@ -305,7 +298,6 @@ def build_summary(ev, symbols=None, relevant_ccys=None):
         prev_txt += "."
         parts.append(prev_txt)
 
-    # Symbol relevance note
     if symbols and relevant_ccys:
         is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
         if is_rel:
@@ -356,8 +348,16 @@ def build_row(ev, idx, symbols, relevant_ccys):
     rel_cls  = "yes" if is_rel else "no"
     rel_title = f"Affects: {', '.join(matched)}" if is_rel else "Not relevant to your symbols"
 
+    # 🎯 Neon highlight ONLY for XAUUSD / XAGUSD
+    neon_cls = ""
+    if is_rel:
+        if "XAUUSD" in matched:
+            neon_cls = "neon gold"
+        elif "XAGUSD" in matched:
+            neon_cls = "neon"
+
     return f"""
-    <tr class="row" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}" data-relevant="{1 if is_rel else 0}">
+    <tr class="row {neon_cls}" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}" data-relevant="{1 if is_rel else 0}">
       <td class="xcol"><span class="xmark {rel_cls}" title="{escape(rel_title)}">{rel_mark}</span></td>
       <td>{escape(str(t))}</td>
       <td><span class="ccy">{escape(str(ev.get('currency','')))}</span></td>
@@ -418,7 +418,6 @@ def build_payload(news, symbols, relevant_ccys):
 # 5. HTML generation
 # --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
-    # --- symbol detection ---
     symbols = get_connected_symbols()
     relevant_ccys = relevant_currencies(symbols)
     print(f"[i] Connected symbols: {', '.join(symbols)}")
@@ -534,6 +533,48 @@ def generate_html(news, output="news_report.html"):
   .xmark.no  {{ opacity: .55; }}
   footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; }}
 
+  /* ✨ Neon highlight for XAUUSD / XAGUSD rows */
+  tbody tr.neon td {{
+    background: rgba(56, 189, 248, 0.06);
+    border-bottom-color: rgba(56, 189, 248, 0.25);
+  }}
+  tbody tr.neon td:first-child {{
+    box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9);
+    animation: neonPulse 2.2s ease-in-out infinite;
+  }}
+  tbody tr.neon:hover td {{
+    background: rgba(56, 189, 248, 0.12);
+  }}
+  @keyframes neonPulse {{
+    0%, 100% {{
+      box-shadow: inset 3px 0 0 0 #38bdf8, inset 6px 0 18px -8px rgba(56,189,248,.9);
+    }}
+    50% {{
+      box-shadow: inset 3px 0 0 0 #7dd3fc, inset 6px 0 26px -6px rgba(125,211,252,1);
+    }}
+  }}
+
+  /* 🥇 Golden neon for XAU */
+  tbody tr.neon.gold td {{
+    background: rgba(251, 191, 36, 0.07);
+    border-bottom-color: rgba(251, 191, 36, 0.25);
+  }}
+  tbody tr.neon.gold td:first-child {{
+    box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9);
+    animation: neonPulseGold 2.2s ease-in-out infinite;
+  }}
+  tbody tr.neon.gold:hover td {{
+    background: rgba(251, 191, 36, 0.13);
+  }}
+  @keyframes neonPulseGold {{
+    0%, 100% {{
+      box-shadow: inset 3px 0 0 0 #fbbf24, inset 6px 0 18px -8px rgba(251,191,36,.9);
+    }}
+    50% {{
+      box-shadow: inset 3px 0 0 0 #fde68a, inset 6px 0 26px -6px rgba(253,230,138,1);
+    }}
+  }}
+
   /* ---------- Modal / Card ---------- */
   .backdrop {{
     position: fixed; inset: 0; background: rgba(2,6,23,.75);
@@ -631,6 +672,9 @@ def generate_html(news, output="news_report.html"):
     <span>{escape(symbols_str)}</span>
     <span class="lbl">·&nbsp; Relevant currencies:</span>
     <span>{escape(rel_ccy_str)}</span>
+    <span class="lbl">·&nbsp; Legend:</span>
+    <code style="color:#fbbf24">🟡 XAUUSD</code>
+    <code style="color:#38bdf8">🔵 XAGUSD</code>
   </div>
 
   <div class="stats">
@@ -717,7 +761,6 @@ function openCard(idx) {{
   document.getElementById('c-sub').innerHTML =
     `<span class="ccy">${{n.currency}}</span> &nbsp;•&nbsp; ${{n.country}} &nbsp;•&nbsp; ${{n.importance.toUpperCase()}} impact &nbsp;•&nbsp; ${{n.type}}`;
 
-  // Relevance banner
   const rel = document.getElementById('c-rel');
   if (n.relevant) {{
     rel.className = 'rel-banner yes';
@@ -772,12 +815,10 @@ function closeCard() {{
 
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeCard(); }});
 
-// Wire up row clicks
 document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
   tr.addEventListener('click', () => openCard(parseInt(tr.dataset.idx, 10)));
 }});
 
-// Filtering
 function filterRows() {{
   const q    = document.getElementById('search').value.toLowerCase();
   const imp  = document.getElementById('impFilter').value;
