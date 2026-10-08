@@ -14,7 +14,6 @@ TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Tehran")
 #    pip install biquote
 # --------------------------------------------------------------------
 def _get(obj, *names, default=None):
-    """Try multiple attribute/key names on an object or dict."""
     for n in names:
         if isinstance(obj, dict) and n in obj and obj[n] not in (None, ""):
             return obj[n]
@@ -28,21 +27,13 @@ def fetch_free_news():
     try:
         from biquote import Biquote
         bq = Biquote()
-
-        # ✅ Fetch ALL news — no importance filter
-        events = bq.calendar()
-
-        # If your biquote version requires a date range, uncomment below:
-        # from datetime import date
-        # today = date.today()
-        # events = bq.calendar(from_date=today, to_date=today + timedelta(days=7))
+        events = bq.calendar()   # ALL news
 
         print(f"[i] biquote returned {len(events)} raw events (ALL importance).")
         if events:
             sample = events[0]
             fields = sample.keys() if isinstance(sample, dict) else vars(sample)
             print(f"[i] Sample fields: {list(fields)}")
-            print(f"[i] Sample object: {sample}")
 
         converted = []
         for e in events:
@@ -67,6 +58,8 @@ def fetch_free_news():
                 'revision':       _get(e, 'revision', default=0),
                 'timeMode':       _get(e, 'timeMode', default='exact'),
                 'sourceUrl':      _get(e, 'sourceUrl', 'url', default=''),
+                # 📰 optional news text — may be missing
+                'description':    _get(e, 'description', 'text', 'news_text', 'details', 'summary'),
                 'source':         'biquote',
             })
         return converted
@@ -76,7 +69,7 @@ def fetch_free_news():
 
 
 # --------------------------------------------------------------------
-# 2. Data loading: news.json → biquote → inline list
+# 2. Data loading
 # --------------------------------------------------------------------
 LOCAL_NEWS = []
 
@@ -105,7 +98,7 @@ def load_news():
 
 
 # --------------------------------------------------------------------
-# 3. HTML generation
+# 3. Helpers
 # --------------------------------------------------------------------
 IMPORTANCE_COLORS = {
     "high":   ("#e53935", "#ffebee"),
@@ -116,18 +109,26 @@ IMPORTANCE_COLORS = {
 }
 
 def to_tehran(iso_str):
-    """Convert an ISO timestamp (any tz) to Tehran time and format."""
     if not iso_str:
         return ""
     s = str(iso_str).strip()
     try:
-        # Handle trailing 'Z'
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        # If naive, assume UTC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        dt_tehran = dt.astimezone(TEHRAN_TZ)
-        return dt_tehran.strftime("%Y-%m-%d %H:%M")   # header already says Tehran
+        return dt.astimezone(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return s
+
+def to_utc(iso_str):
+    if not iso_str:
+        return ""
+    s = str(iso_str).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return s
 
@@ -139,12 +140,64 @@ def fmt_value(v, digits=2):
     except (ValueError, TypeError):
         return escape(str(v))
 
-def build_row(ev):
+def build_summary(ev):
+    """Generate readable news text when no description exists."""
+    name = ev.get("name") or "Event"
+    ccy  = ev.get("currency") or ""
+    imp  = (ev.get("importance") or "").lower()
+    a = ev.get("actual")
+    f = ev.get("forecast")
+    p = ev.get("previous")
+    digits = ev.get("digits") or 2
+    unit = ev.get("unit") or "none"
+    mult = ev.get("multiplier") or "none"
+
+    def n(x):
+        if x is None or x == "":
+            return None
+        try:
+            return f"{float(x):.{int(digits)}f}"
+        except (ValueError, TypeError):
+            return str(x)
+
+    unit_txt = "" if unit in ("none", "", None) else f" ({unit}{', ' + mult if mult not in ('none','',None) else ''})"
+
+    parts = []
+    parts.append(f"{name}{unit_txt} — {ccy} {imp.upper()}-impact event.")
+
+    if n(a) is not None and n(f) is not None:
+        try:
+            diff = float(a) - float(f)
+            direction = "beat" if diff > 0 else ("missed" if diff < 0 else "matched")
+            parts.append(
+                f"Actual came in at {n(a)}, {direction} the forecast of {n(f)} "
+                f"(previous: {n(p) if n(p) is not None else 'N/A'})."
+            )
+        except (TypeError, ValueError):
+            parts.append(f"Actual: {n(a)}, Forecast: {n(f)}, Previous: {n(p)}.")
+    elif n(a) is not None:
+        parts.append(f"Actual released at {n(a)} (forecast: {n(f) or 'N/A'}, previous: {n(p) or 'N/A'}).")
+    elif n(f) is not None:
+        parts.append(f"Scheduled release. Forecast: {n(f)}, Previous: {n(p) if n(p) is not None else 'N/A'}.")
+    else:
+        parts.append("Awaiting release. No numeric values published yet.")
+
+    if imp == "high":
+        parts.append("Considered a high-volatility event — markets may react sharply.")
+    elif imp == "medium":
+        parts.append("Moderate impact expected on related currency pairs.")
+
+    return " ".join(parts)
+
+
+# --------------------------------------------------------------------
+# 4. HTML row + JSON payload
+# --------------------------------------------------------------------
+def build_row(ev, idx):
     imp = (ev.get("importance") or "low").lower()
     color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
 
-    t = to_tehran(ev.get("time"))   # ✅ Tehran time
-
+    t = to_tehran(ev.get("time"))
     digits = ev.get("digits") or 2
     actual   = fmt_value(ev.get("actual"),   digits)
     forecast = fmt_value(ev.get("forecast"), digits)
@@ -158,7 +211,7 @@ def build_row(ev):
         pass
 
     return f"""
-    <tr data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}">
+    <tr class="row" data-idx="{idx}" data-importance="{imp}" data-currency="{escape(str(ev.get('currency','')))}">
       <td>{escape(str(t))}</td>
       <td><span class="ccy">{escape(str(ev.get('currency','')))}</span></td>
       <td><span class="badge" style="background:{bg};color:{color};border:1px solid {color}">{imp.upper()}</span></td>
@@ -171,6 +224,49 @@ def build_row(ev):
     </tr>"""
 
 
+def build_payload(news):
+    """Prepare JSON-safe payload for the modal."""
+    out = []
+    for ev in news:
+        imp = (ev.get("importance") or "low").lower()
+        color, bg = IMPORTANCE_COLORS.get(imp, ("#757575", "#f5f5f5"))
+        text = ev.get("description")
+        if not text:
+            text = build_summary(ev)
+
+        out.append({
+            "name":        ev.get("name") or "—",
+            "currency":    ev.get("currency") or "—",
+            "country":     ev.get("countryCode") or "—",
+            "importance":  imp,
+            "impColor":    color,
+            "impBg":       bg,
+            "timeTehran":  to_tehran(ev.get("time")) or "—",
+            "timeUtc":     to_utc(ev.get("time")) or "—",
+            "period":      ev.get("period") or "—",
+            "actual":      fmt_value(ev.get("actual"),   ev.get("digits") or 2),
+            "forecast":    fmt_value(ev.get("forecast"), ev.get("digits") or 2),
+            "previous":    fmt_value(ev.get("previous"), ev.get("digits") or 2),
+            "revisedPrevious": fmt_value(ev.get("revisedPrevious"), ev.get("digits") or 2),
+            "revision":    ev.get("revision", 0),
+            "type":        ev.get("type") or "—",
+            "sector":      ev.get("sector") or "—",
+            "unit":        ev.get("unit") or "none",
+            "multiplier":  ev.get("multiplier") or "none",
+            "digits":      ev.get("digits") or 2,
+            "timeMode":    ev.get("timeMode") or "—",
+            "eventId":     ev.get("eventId") or "—",
+            "id":          ev.get("id") or "—",
+            "source":      ev.get("source") or "—",
+            "sourceUrl":   ev.get("sourceUrl") or "",
+            "text":        text,
+        })
+    return out
+
+
+# --------------------------------------------------------------------
+# 5. HTML generation
+# --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
     def sort_key(e):
         t = e.get("time") or ""
@@ -183,10 +279,11 @@ def generate_html(news, output="news_report.html"):
             return datetime.max.replace(tzinfo=timezone.utc)
 
     news = sorted(news, key=sort_key)
-    rows = "\n".join(build_row(e) for e in news)
+    rows = "\n".join(build_row(e, i) for i, e in enumerate(news))
+    payload_json = json.dumps(build_payload(news), ensure_ascii=False)
+
     generated_at = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M Tehran")
     total = len(news)
-
     highs   = sum(1 for e in news if (e.get("importance") or "").lower() == "high")
     mediums = sum(1 for e in news if (e.get("importance") or "").lower() == "medium")
     lows    = sum(1 for e in news if (e.get("importance") or "").lower() == "low")
@@ -238,7 +335,8 @@ def generate_html(news, output="news_report.html"):
   thead {{ background: #0b1220; position: sticky; top: 0; }}
   th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
   th {{ color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
-  tr:hover td {{ background: rgba(56,189,248,.05); }}
+  tbody tr {{ cursor: pointer; transition: background .15s; }}
+  tbody tr:hover td {{ background: rgba(56,189,248,.08); }}
   .name {{ font-weight: 500; }}
   .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
   .num.beat {{ color: #4ade80; font-weight: 600; }}
@@ -252,6 +350,73 @@ def generate_html(news, output="news_report.html"):
     font-size: 11px; font-weight: 700; letter-spacing: .04em;
   }}
   footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; }}
+
+  /* ---------- Modal / Card ---------- */
+  .backdrop {{
+    position: fixed; inset: 0; background: rgba(2,6,23,.75);
+    backdrop-filter: blur(4px);
+    display: none; align-items: center; justify-content: center;
+    padding: 20px; z-index: 1000;
+  }}
+  .backdrop.open {{ display: flex; }}
+  .card {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; max-width: 720px; width: 100%;
+    max-height: 90vh; overflow-y: auto;
+    box-shadow: 0 25px 60px rgba(0,0,0,.6);
+    animation: pop .18s ease-out;
+  }}
+  @keyframes pop {{
+    from {{ transform: translateY(12px) scale(.98); opacity: 0; }}
+    to   {{ transform: translateY(0) scale(1); opacity: 1; }}
+  }}
+  .card-head {{
+    padding: 18px 22px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+  }}
+  .card-head h2 {{ margin: 0; font-size: 18px; }}
+  .card-head .sub {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
+  .close {{
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 14px;
+  }}
+  .close:hover {{ color: var(--text); border-color: var(--accent); }}
+  .card-body {{ padding: 18px 22px 22px; }}
+
+  .grid {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin-bottom: 16px;
+  }}
+  .field {{
+    background: #0b1220; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px;
+  }}
+  .field .k {{
+    color: var(--muted); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .05em; margin-bottom: 3px;
+  }}
+  .field .v {{ font-size: 14px; font-weight: 600; word-break: break-word; }}
+  .field .v.big {{ font-size: 18px; }}
+  .field .v.beat {{ color: #4ade80; }}
+  .field .v.miss {{ color: #f87171; }}
+
+  .news-text {{
+    background: linear-gradient(135deg, #0b1220 0%, #162033 100%);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 14px 16px; margin-top: 6px;
+  }}
+  .news-text .lbl {{
+    color: var(--accent); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px;
+  }}
+  .news-text .body {{ line-height: 1.6; font-size: 14px; color: #cbd5e1; }}
+
+  .src-link {{
+    display: inline-block; margin-top: 14px; color: var(--accent);
+    font-size: 13px; text-decoration: none; border-bottom: 1px dashed var(--accent);
+  }}
+  .src-link:hover {{ opacity: .8; }}
+
   @media (max-width: 720px) {{
     table, thead, tbody, th, td, tr {{ display: block; }}
     thead {{ display: none; }}
@@ -264,7 +429,7 @@ def generate_html(news, output="news_report.html"):
 <body>
   <header>
     <h1>📊 MQL5 Economic News Report — ALL Events</h1>
-    <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events</div>
+    <div class="meta">Generated: {generated_at} &nbsp;•&nbsp; {total} events &nbsp;•&nbsp; Click any row for details</div>
   </header>
 
   <div class="stats">
@@ -306,7 +471,96 @@ def generate_html(news, output="news_report.html"):
 
   <footer>Generated locally • No API credits used • Times shown in Tehran (UTC+3:30)</footer>
 
+  <!-- 🔔 News detail card -->
+  <div class="backdrop" id="backdrop" onclick="if(event.target===this) closeCard()">
+    <div class="card" id="card">
+      <div class="card-head">
+        <div>
+          <h2 id="c-name">—</h2>
+          <div class="sub" id="c-sub">—</div>
+        </div>
+        <button class="close" onclick="closeCard()">✕ Close</button>
+      </div>
+      <div class="card-body">
+        <div class="grid" id="c-grid"></div>
+
+        <div class="news-text">
+          <div class="lbl">📰 News Text</div>
+          <div class="body" id="c-text">—</div>
+        </div>
+
+        <a id="c-source" class="src-link" href="#" target="_blank" rel="noopener">🔗 Official source</a>
+      </div>
+    </div>
+  </div>
+
 <script>
+const NEWS = {payload_json};
+
+function field(k, v, cls="") {{
+  return `<div class="field"><div class="k">${{k}}</div><div class="v ${{cls}}">${{v}}</div></div>`;
+}}
+
+function openCard(idx) {{
+  const n = NEWS[idx];
+  if (!n) return;
+
+  document.getElementById('c-name').textContent = n.name;
+  document.getElementById('c-sub').innerHTML =
+    `<span class="ccy">${{n.currency}}</span> &nbsp;•&nbsp; ${{n.country}} &nbsp;•&nbsp; ${{n.importance.toUpperCase()}} impact &nbsp;•&nbsp; ${{n.type}}`;
+
+  // Actual / Forecast / Previous with beat/miss coloring
+  let aCls = "";
+  const a = parseFloat(n.actual), f = parseFloat(n.forecast);
+  if (!isNaN(a) && !isNaN(f)) aCls = a > f ? "beat" : (a < f ? "miss" : "");
+
+  const grid = [
+    field("Time (Tehran)", n.timeTehran, "big"),
+    field("Time (UTC)",    n.timeUtc),
+    field("Actual",        n.actual,   aCls),
+    field("Forecast",      n.forecast),
+    field("Previous",      n.previous),
+    field("Revised Prev.", n.revisedPrevious),
+    field("Currency",      n.currency),
+    field("Country",       n.country),
+    field("Importance",    n.importance.toUpperCase()),
+    field("Sector",        n.sector),
+    field("Type",          n.type),
+    field("Unit",          n.unit),
+    field("Multiplier",    n.multiplier),
+    field("Digits",        n.digits),
+    field("Period",        n.period),
+    field("Event ID",      n.eventId),
+    field("ID",            n.id),
+    field("Source",        n.source),
+  ].join("");
+
+  document.getElementById('c-grid').innerHTML = grid;
+  document.getElementById('c-text').textContent = n.text;
+
+  const link = document.getElementById('c-source');
+  if (n.sourceUrl) {{
+    link.href = n.sourceUrl;
+    link.style.display = 'inline-block';
+  }} else {{
+    link.style.display = 'none';
+  }}
+
+  document.getElementById('backdrop').classList.add('open');
+}}
+
+function closeCard() {{
+  document.getElementById('backdrop').classList.remove('open');
+}}
+
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeCard(); }});
+
+// Wire up row clicks
+document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
+  tr.addEventListener('click', () => openCard(parseInt(tr.dataset.idx, 10)));
+}});
+
+// Filtering
 function filterRows() {{
   const q   = document.getElementById('search').value.toLowerCase();
   const imp = document.getElementById('impFilter').value;
