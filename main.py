@@ -146,13 +146,21 @@ def fmt_value(v, digits=2):
 
 
 def build_summary(ev):
-    """Short, headline-style summary. Does NOT repeat grid values."""
-    name = ev.get("name") or "Event"
-    ccy  = ev.get("currency") or ""
-    imp  = (ev.get("importance") or "").lower()
-    a = ev.get("actual")
-    f = ev.get("forecast")
-    digits = int(ev.get("digits") or 2)
+    """Full news-style narrative paragraph."""
+    name    = ev.get("name") or "Event"
+    ccy     = ev.get("currency") or ""
+    country = ev.get("countryCode") or ""
+    imp     = (ev.get("importance") or "").lower()
+    typ     = ev.get("type") or "indicator"
+    sector  = ev.get("sector") or ""
+    unit    = ev.get("unit") or "none"
+    mult    = ev.get("multiplier") or "none"
+    digits  = int(ev.get("digits") or 2)
+
+    a  = ev.get("actual")
+    f  = ev.get("forecast")
+    p  = ev.get("previous")
+    rp = ev.get("revisedPrevious")
 
     def n(x):
         if x is None or x == "":
@@ -162,31 +170,89 @@ def build_summary(ev):
         except (ValueError, TypeError):
             return str(x)
 
-    # No numbers at all yet
-    if n(a) is None and n(f) is None:
-        return f"⏳ Awaiting release for {ccy}. No forecast available."
+    # Unit description
+    unit_txt = ""
+    if unit not in ("none", "", None):
+        unit_txt = f" measured in {unit}"
+        if mult not in ("none", "", None):
+            unit_txt += f" ({mult})"
 
-    # Scheduled but not released
-    if n(a) is None and n(f) is not None:
-        return f"⏳ Scheduled release for {ccy}. Market expects {n(f)}. Awaiting publication."
+    # Impact phrase
+    impact_phrase = {
+        "high":   "a high-impact release that frequently triggers sharp moves in related currency pairs",
+        "medium": "a medium-impact release that can cause moderate volatility in related markets",
+        "low":    "a low-impact release that typically produces limited market reaction",
+    }.get(imp, "an economic release")
 
-    # Numbers available → one-line verdict
-    try:
-        a_f = float(a)
-        f_f = float(f) if f is not None else None
-        if f_f is not None:
+    parts = []
+
+    # 1. Intro
+    sector_txt = f" in the {sector} sector" if sector else ""
+    parts.append(
+        f"{name} is {impact_phrase}. "
+        f"It is a {ccy} {typ}{sector_txt}, published by {country}{unit_txt}."
+    )
+
+    # 2. Numbers
+    if n(a) is not None and n(f) is not None:
+        try:
+            a_f = float(a)
+            f_f = float(f)
             diff = a_f - f_f
+            pct = (abs(diff) / abs(f_f) * 100) if f_f != 0 else 0
+
             if diff > 0:
-                verdict = f"📈 Beat forecast by {abs(diff):.{digits}f}"
+                verdict = (
+                    f"The actual reading came in at {n(a)}, exceeding the forecast of {n(f)} "
+                    f"by {abs(diff):.{digits}f} ({pct:.1f}%). This stronger-than-expected result "
+                    f"is generally bullish for {ccy}."
+                )
             elif diff < 0:
-                verdict = f"📉 Missed forecast by {abs(diff):.{digits}f}"
+                verdict = (
+                    f"The actual reading came in at {n(a)}, falling short of the forecast of {n(f)} "
+                    f"by {abs(diff):.{digits}f} ({pct:.1f}%). This weaker-than-expected result "
+                    f"is generally bearish for {ccy}."
+                )
             else:
-                verdict = "➖ Matched forecast exactly"
-            return f"{verdict} — {name} ({ccy}, {imp.upper()} impact)."
-        else:
-            return f"✅ Released at {n(a)} — {name} ({ccy}, {imp.upper()} impact)."
-    except (TypeError, ValueError):
-        return f"Released: {n(a)} — {name} ({ccy}, {imp.upper()} impact)."
+                verdict = (
+                    f"The actual reading of {n(a)} matched the forecast exactly. "
+                    f"Markets are unlikely to react strongly to this release."
+                )
+            parts.append(verdict)
+        except (TypeError, ValueError):
+            parts.append(f"Actual: {n(a)}, Forecast: {n(f)}, Previous: {n(p)}.")
+    elif n(a) is not None:
+        parts.append(f"The actual reading was released at {n(a)}.")
+    elif n(f) is not None:
+        parts.append(
+            f"The event is scheduled for release. Analysts forecast a reading of {n(f)}. "
+            f"Markets will watch closely for the actual figure."
+        )
+    else:
+        parts.append(
+            "The event has been scheduled but no forecast or actual values are available yet."
+        )
+
+    # 3. Previous context
+    if n(p) is not None:
+        prev_txt = f"The previous reading was {n(p)}"
+        if n(rp) is not None and str(rp) != str(p):
+            prev_txt += f", later revised to {n(rp)}"
+        prev_txt += "."
+        parts.append(prev_txt)
+
+    # 4. Closing / market note
+    if imp == "high":
+        parts.append(
+            "Traders should be prepared for increased volatility around the release time. "
+            "Use appropriate risk management and consider spread widening on affected pairs."
+        )
+    elif imp == "medium":
+        parts.append(
+            "Traders may want to monitor the release for potential short-term opportunities."
+        )
+
+    return " ".join(parts)
 
 
 # --------------------------------------------------------------------
@@ -407,7 +473,7 @@ def generate_html(news, output="news_report.html"):
     color: var(--accent); font-size: 11px; font-weight: 700;
     text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px;
   }}
-  .news-text .body {{ line-height: 1.6; font-size: 14px; color: #cbd5e1; }}
+  .news-text .body {{ line-height: 1.7; font-size: 14px; color: #cbd5e1; }}
 
   .src-link {{
     display: inline-block; margin-top: 14px; color: var(--accent);
