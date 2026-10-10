@@ -83,9 +83,6 @@ def _get(obj, *names, default=None):
     return default
 
 
-# --------------------------------------------------------------------
-# 1. Live fetch via biquote — TODAY only
-# --------------------------------------------------------------------
 def fetch_free_news(today_only=True):
     try:
         from biquote import Biquote
@@ -162,9 +159,6 @@ def fetch_free_news(today_only=True):
         return None
 
 
-# --------------------------------------------------------------------
-# 2. Data loading (biquote only, with inline fallback)
-# --------------------------------------------------------------------
 LOCAL_NEWS = []
 
 
@@ -243,7 +237,7 @@ def matches_symbols(ev, symbols, relevant_ccys):
 
 
 # --------------------------------------------------------------------
-# 3b. Trade advice — inverse-aware, structured
+# Trade advice
 # --------------------------------------------------------------------
 def build_trade_advice(ev, matched_syms):
     name  = ev.get("name") or "Event"
@@ -563,7 +557,138 @@ def build_row(ev, idx, symbols, relevant_ccys):
     </tr>"""
 
 
+# --------------------------------------------------------------------
+# Event metadata (for AI + card JSON view)
+# --------------------------------------------------------------------
+def build_event_metadata(ev, symbols, relevant_ccys, now_utc):
+    imp     = (ev.get("importance") or "low").lower()
+    name    = ev.get("name") or "Event"
+    ccy     = (ev.get("currency") or "").upper()
+    digits  = int(ev.get("digits") or 2)
+
+    def num(x):
+        if x is None or x == "":
+            return None
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return None
+
+    a_f  = num(ev.get("actual"))
+    f_f  = num(ev.get("forecast"))
+    p_f  = num(ev.get("previous"))
+    rp_f = num(ev.get("revisedPrevious"))
+
+    inverse = is_inverse_indicator(name)
+
+    deviation = None
+    surprise  = None
+    surprise_pct = None
+    trend = None
+    trend_dir = None
+    released = a_f is not None
+    time_dt = parse_iso(ev.get("time"))
+    time_utc_iso    = time_dt.astimezone(timezone.utc).isoformat() if time_dt else None
+    time_tehran_iso = time_dt.astimezone(TEHRAN_TZ).isoformat() if time_dt else None
+    seconds_until = None
+    is_upcoming = None
+    if time_dt:
+        delta = (time_dt - now_utc).total_seconds()
+        seconds_until = int(delta)
+        is_upcoming = delta > 0
+
+    if a_f is not None and f_f is not None:
+        deviation = a_f - f_f
+        surprise = "beat" if deviation > 0 else ("miss" if deviation < 0 else "inline")
+        if f_f != 0:
+            surprise_pct = round((deviation / abs(f_f)) * 100, 4)
+
+    if f_f is not None and p_f is not None:
+        diff = f_f - p_f
+        if diff > 0:
+            trend = "up"
+            trend_dir = "forecast higher than previous"
+        elif diff < 0:
+            trend = "down"
+            trend_dir = "forecast lower than previous"
+        else:
+            trend = "flat"
+            trend_dir = "forecast equals previous"
+
+    is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
+    advice = build_trade_advice(ev, matched) if (is_rel and matched) else None
+
+    symbol_signals = []
+    if advice:
+        for r in advice["rows"]:
+            symbol_signals.append({
+                "symbol": r["symbol"],
+                "signal": r["signal"],
+                "reason": r["reason"],
+            })
+
+    base_strength = advice["strength"] if advice else 0
+    base_strength_label = (
+        "stronger" if base_strength > 0 else
+        "weaker"   if base_strength < 0 else
+        "neutral"
+    )
+
+    return {
+        "id":               ev.get("id"),
+        "eventId":          ev.get("eventId"),
+        "name":             name,
+        "type":             ev.get("type"),
+        "sector":           ev.get("sector"),
+        "currency":         ccy,
+        "countryCode":      ev.get("countryCode"),
+        "importance":       imp,
+        "inverseIndicator": inverse,
+
+        "timeUtcIso":       time_utc_iso,
+        "timeTehranIso":    time_tehran_iso,
+        "timeUtcReadable":  to_utc(ev.get("time")),
+        "timeTehranReadable": to_tehran(ev.get("time")),
+        "period":           ev.get("period"),
+        "timeMode":         ev.get("timeMode"),
+        "secondsUntil":     seconds_until,
+        "isUpcoming":       is_upcoming,
+        "isReleased":       released,
+
+        "actual":           a_f,
+        "forecast":         f_f,
+        "previous":         p_f,
+        "revisedPrevious":  rp_f,
+        "revision":         ev.get("revision"),
+        "unit":             ev.get("unit"),
+        "multiplier":       ev.get("multiplier"),
+        "digits":           digits,
+
+        "deviation":        round(deviation, 4) if deviation is not None else None,
+        "surprise":         surprise,
+        "surprisePct":      surprise_pct,
+        "trend":            trend,
+        "trendDir":         trend_dir,
+
+        "isRelevant":       is_rel,
+        "matchedSymbols":   matched,
+
+        "tradeScenario":    advice["scenario"] if advice else None,
+        "baseCurrencyStrength": base_strength_label,
+        "baseStrengthValue": base_strength,
+        "tradeHeadline":    advice["headline"] if advice else None,
+        "tradeConfidence":  advice["confidence"] if advice else None,
+        "tradeNote":        advice["note"] if advice else None,
+        "symbolSignals":    symbol_signals,
+
+        "newsText":         ev.get("description") or build_summary(ev, symbols, relevant_ccys),
+        "source":           ev.get("source"),
+        "sourceUrl":        ev.get("sourceUrl"),
+    }
+
+
 def build_payload(news, symbols, relevant_ccys):
+    now_utc = datetime.now(timezone.utc)
     out = []
     for ev in news:
         imp = (ev.get("importance") or "low").lower()
@@ -578,6 +703,9 @@ def build_payload(news, symbols, relevant_ccys):
         if is_rel and matched:
             advice = build_trade_advice(ev, matched)
             advice_html = render_trade_advice_html(advice)
+
+        # Per-event metadata for the card's "🤖 Metadata (JSON)" section
+        metadata = build_event_metadata(ev, symbols, relevant_ccys, now_utc)
 
         out.append({
             "name":        ev.get("name") or "—",
@@ -609,144 +737,21 @@ def build_payload(news, symbols, relevant_ccys):
             "relevant":    is_rel,
             "matchedSyms": matched,
             "adviceHtml":  advice_html,
+            "metadata":    metadata,   # 🆕 per-event AI metadata
         })
     return out
 
 
 # --------------------------------------------------------------------
-# 6. 🤖 AI-friendly metadata export
+# AI metadata export (global)
 # --------------------------------------------------------------------
 def export_metadata(news, symbols, relevant_ccys, output="news_metadata.json"):
     now_tehran = datetime.now(TEHRAN_TZ)
     now_utc = now_tehran.astimezone(timezone.utc)
 
-    def num(x):
-        if x is None or x == "":
-            return None
-        try:
-            return float(x)
-        except (ValueError, TypeError):
-            return None
-
     events_out = []
     for ev in news:
-        imp     = (ev.get("importance") or "low").lower()
-        name    = ev.get("name") or "Event"
-        ccy     = (ev.get("currency") or "").upper()
-        digits  = int(ev.get("digits") or 2)
-
-        a_f = num(ev.get("actual"))
-        f_f = num(ev.get("forecast"))
-        p_f = num(ev.get("previous"))
-        rp_f = num(ev.get("revisedPrevious"))
-
-        inverse = is_inverse_indicator(name)
-
-        surprise = None
-        surprise_pct = None
-        deviation = None
-        trend = None
-        trend_dir = None
-        released = a_f is not None
-        time_dt = parse_iso(ev.get("time"))
-        time_utc_iso = time_dt.astimezone(timezone.utc).isoformat() if time_dt else None
-        time_tehran_iso = time_dt.astimezone(TEHRAN_TZ).isoformat() if time_dt else None
-        seconds_until = None
-        is_upcoming = None
-        if time_dt:
-            delta = (time_dt - now_utc).total_seconds()
-            seconds_until = int(delta)
-            is_upcoming = delta > 0
-
-        if a_f is not None and f_f is not None:
-            deviation = a_f - f_f
-            surprise = "beat" if deviation > 0 else ("miss" if deviation < 0 else "inline")
-            if f_f != 0:
-                surprise_pct = round((deviation / abs(f_f)) * 100, 4)
-
-        if f_f is not None and p_f is not None:
-            diff = f_f - p_f
-            if diff > 0:
-                trend = "up"
-                trend_dir = "forecast higher than previous"
-            elif diff < 0:
-                trend = "down"
-                trend_dir = "forecast lower than previous"
-            else:
-                trend = "flat"
-                trend_dir = "forecast equals previous"
-
-        is_rel, matched = matches_symbols(ev, symbols, relevant_ccys)
-        advice = build_trade_advice(ev, matched) if (is_rel and matched) else None
-
-        symbol_signals = []
-        if advice:
-            for r in advice["rows"]:
-                symbol_signals.append({
-                    "symbol":       r["symbol"],
-                    "signal":       r["signal"],
-                    "reason":       r["reason"],
-                })
-
-        base_strength = advice["strength"] if advice else 0
-        base_strength_label = (
-            "stronger" if base_strength > 0 else
-            "weaker"   if base_strength < 0 else
-            "neutral"
-        )
-
-        events_out.append({
-            "id":               ev.get("id"),
-            "eventId":          ev.get("eventId"),
-            "name":             name,
-            "type":             ev.get("type"),
-            "sector":           ev.get("sector"),
-
-            "currency":         ccy,
-            "countryCode":      ev.get("countryCode"),
-            "importance":       imp,
-            "inverseIndicator": inverse,
-
-            "timeUtcIso":       time_utc_iso,
-            "timeTehranIso":    time_tehran_iso,
-            "timeUtcReadable":  to_utc(ev.get("time")),
-            "timeTehranReadable": to_tehran(ev.get("time")),
-            "period":           ev.get("period"),
-            "timeMode":         ev.get("timeMode"),
-            "secondsUntil":     seconds_until,
-            "isUpcoming":       is_upcoming,
-            "isReleased":       released,
-
-            "actual":           a_f,
-            "forecast":         f_f,
-            "previous":         p_f,
-            "revisedPrevious":  rp_f,
-            "revision":         ev.get("revision"),
-            "unit":             ev.get("unit"),
-            "multiplier":       ev.get("multiplier"),
-            "digits":           digits,
-
-            "deviation":        round(deviation, 4) if deviation is not None else None,
-            "surprise":         surprise,
-            "surprisePct":      surprise_pct,
-            "trend":            trend,
-            "trendDir":         trend_dir,
-
-            "isRelevant":       is_rel,
-            "matchedSymbols":   matched,
-
-            "tradeScenario":    advice["scenario"] if advice else None,
-            "baseCurrencyStrength": base_strength_label,
-            "baseStrengthValue": base_strength,
-            "tradeHeadline":    advice["headline"] if advice else None,
-            "tradeConfidence":  advice["confidence"] if advice else None,
-            "tradeNote":        advice["note"] if advice else None,
-            "symbolSignals":    symbol_signals,
-
-            "newsText":         ev.get("description") or build_summary(ev, symbols, relevant_ccys),
-            "source":           ev.get("source"),
-            "sourceUrl":        ev.get("sourceUrl"),
-        })
+        events_out.append(build_event_metadata(ev, symbols, relevant_ccys, now_utc))
 
     total      = len(events_out)
     relevant   = [e for e in events_out if e["isRelevant"]]
@@ -765,7 +770,7 @@ def export_metadata(news, symbols, relevant_ccys, output="news_metadata.json"):
 
     metadata = {
         "meta": {
-            "generator":        "news_to_html.py",
+            "generator":        "news_to_html => Main.py",
             "schemaVersion":    "1.0",
             "generatedAtTehran": now_tehran.isoformat(),
             "generatedAtUtc":   now_utc.isoformat(),
@@ -774,7 +779,13 @@ def export_metadata(news, symbols, relevant_ccys, output="news_metadata.json"):
             "note": (
                 "Rich structured export for AI analysis. "
                 "Includes raw event data, derived analytics, and per-symbol trade signals."
+                "Based this on the MQL5 economic calendar and biquote.com data."
+                "And you can also use this JSON to build your own custom dashboards, charts, or trading bots."
+                "or if you are AI Tool Check a Source Site for the latest information to validate the data and make sure it is correct."
             ),
+            "disclaimer": "This JSON is intended for educational and informational purposes only. The data provided should not be considered financial advice.",
+            "developer" : "Shayan Ghadamian",
+            "GitHub": "https://github.com/shayanghad0"
         },
         "marketContext": {
             "connectedSymbols":       symbols,
@@ -815,7 +826,7 @@ def export_metadata(news, symbols, relevant_ccys, output="news_metadata.json"):
 
 
 # --------------------------------------------------------------------
-# 7. HTML generation
+# HTML generation
 # --------------------------------------------------------------------
 def generate_html(news, output="news_report.html"):
     symbols = get_connected_symbols()
@@ -823,7 +834,6 @@ def generate_html(news, output="news_report.html"):
     print(f"[i] Connected symbols: {', '.join(symbols)}")
     print(f"[i] Relevant currencies: {', '.join(sorted(relevant_ccys))}")
 
-    # 🤖 Export AI metadata BEFORE building HTML
     export_metadata(news, symbols, relevant_ccys, output="news_metadata.json")
 
     def sort_key(e):
@@ -1038,6 +1048,41 @@ def generate_html(news, output="news_report.html"):
   .advice-disclaimer {{ font-size: 11px; color: var(--muted); font-style: italic;
     padding-top: 6px; border-top: 1px dashed var(--border); }}
 
+  /* 🤖 Metadata (JSON) section */
+  .metadata-box {{ margin-top: 14px; background: linear-gradient(135deg, #0b1220 0%, #1a2739 100%);
+    border: 1px solid var(--border); border-left: 3px solid #a78bfa;
+    border-radius: 10px; padding: 14px 16px; }}
+  .metadata-box .lbl {{ color: #a78bfa; font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px; }}
+  .metadata-box .lbl .copy-btn {{
+    background: rgba(167,139,250,.15); color: #c4b5fd;
+    border: 1px solid rgba(167,139,250,.4);
+    padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    font-size: 11px; font-weight: 700; letter-spacing: .03em;
+    transition: all .15s;
+  }}
+  .metadata-box .lbl .copy-btn:hover {{
+    background: rgba(167,139,250,.25); color: #ddd6fe;
+  }}
+  .metadata-box .lbl .copy-btn.copied {{
+    background: rgba(74,222,128,.2); color: var(--buy);
+    border-color: rgba(74,222,128,.5);
+  }}
+  .metadata-json {{
+    background: #060a15; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px;
+    font-family: "SF Mono", Consolas, "Courier New", monospace;
+    font-size: 12px; line-height: 1.6; color: #cbd5e1;
+    white-space: pre; overflow-x: auto; max-height: 320px; overflow-y: auto;
+    tab-size: 2;
+  }}
+  .metadata-json .k {{ color: #7dd3fc; }}
+  .metadata-json .s {{ color: #86efac; }}
+  .metadata-json .n {{ color: #fbbf24; }}
+  .metadata-json .b {{ color: #f472b6; }}
+  .metadata-json .null {{ color: #94a3b8; font-style: italic; }}
+
   .src-link {{ display: inline-block; margin-top: 14px; color: var(--accent);
     font-size: 13px; text-decoration: none; border-bottom: 1px dashed var(--accent); }}
   .src-link:hover {{ opacity: .8; }}
@@ -1150,6 +1195,14 @@ def generate_html(news, output="news_report.html"):
           <div id="c-advice-body"></div>
         </div>
 
+        <div class="metadata-box">
+          <div class="lbl">
+            <span>🤖 Metadata (JSON)</span>
+            <button class="copy-btn" id="copy-meta-btn" onclick="copyMetadata()">📋 Copy JSON</button>
+          </div>
+          <pre class="metadata-json" id="c-metadata">—</pre>
+        </div>
+
         <a id="c-source" class="src-link" href="#" target="_blank" rel="noopener">🔗 Official source</a>
       </div>
     </div>
@@ -1158,6 +1211,9 @@ def generate_html(news, output="news_report.html"):
 <script>
 const NEWS = {payload_json};
 
+let currentMetadataJson = "";   // holds the pretty JSON of the open card
+
+/* ---------- Live countdown ---------- */
 function humanDelta(ms) {{
   const past = ms < 0;
   let s = Math.abs(Math.floor(ms / 1000));
@@ -1237,8 +1293,30 @@ function tick() {{
 setInterval(tick, 1000);
 tick();
 
+/* ---------- Card ---------- */
 function field(k, v, cls="") {{
   return `<div class="field"><div class="k">${{k}}</div><div class="v ${{cls}}">${{v}}</div></div>`;
+}}
+
+/* Lightweight JSON pretty printer with syntax colouring */
+function highlightJson(obj) {{
+  let json = JSON.stringify(obj, null, 2);
+  // Escape HTML first
+  json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Colour keys, strings, numbers, booleans, null
+  json = json.replace(/("(\\u[a-zA-Z0-9]{{4}}|\\[^u]|[^\\"])*"(\\s*:)?|\\b(true|false)\\b|\\bnull\\b|-?\\d+(?:\\.\\d*)?(?:[eE][+\\-]?\\d+)?)/g, function(match) {{
+    let cls = 'n';
+    if (/^"/.test(match)) {{
+      if (/:$/.test(match)) cls = 'k';
+      else cls = 's';
+    }} else if (/true|false/.test(match)) {{
+      cls = 'b';
+    }} else if (/null/.test(match)) {{
+      cls = 'null';
+    }}
+    return '<span class="' + cls + '">' + match + '</span>';
+  }});
+  return json;
 }}
 
 function openCard(idx) {{
@@ -1303,6 +1381,19 @@ function openCard(idx) {{
     advBody.innerHTML = '';
   }}
 
+  /* 🤖 Metadata (JSON) */
+  if (n.metadata) {{
+    currentMetadataJson = JSON.stringify(n.metadata, null, 2);
+    document.getElementById('c-metadata').innerHTML = highlightJson(n.metadata);
+  }} else {{
+    currentMetadataJson = '';
+    document.getElementById('c-metadata').textContent = '—';
+  }}
+  // Reset copy button state
+  const btn = document.getElementById('copy-meta-btn');
+  btn.classList.remove('copied');
+  btn.textContent = '📋 Copy JSON';
+
   const link = document.getElementById('c-source');
   if (n.sourceUrl) {{
     link.href = n.sourceUrl;
@@ -1318,12 +1409,47 @@ function closeCard() {{
   document.getElementById('backdrop').classList.remove('open');
 }}
 
+function copyMetadata() {{
+  if (!currentMetadataJson) return;
+  const btn = document.getElementById('copy-meta-btn');
+
+  const done = () => {{
+    btn.classList.add('copied');
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => {{
+      btn.classList.remove('copied');
+      btn.textContent = '📋 Copy JSON';
+    }}, 1800);
+  }};
+
+  if (navigator.clipboard && window.isSecureContext) {{
+    navigator.clipboard.writeText(currentMetadataJson).then(done).catch(() => {{
+      fallbackCopy(currentMetadataJson, done);
+    }});
+  }} else {{
+    fallbackCopy(currentMetadataJson, done);
+  }}
+}}
+
+function fallbackCopy(text, cb) {{
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {{ document.execCommand('copy'); cb && cb(); }}
+  catch (e) {{ alert('Copy failed — please select and copy manually.'); }}
+  document.body.removeChild(ta);
+}}
+
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeCard(); }});
 
 document.querySelectorAll('#newsTable tbody tr').forEach(tr => {{
   tr.addEventListener('click', () => openCard(parseInt(tr.dataset.idx, 10)));
 }});
 
+/* ---------- Filtering ---------- */
 function filterRows() {{
   const q    = document.getElementById('search').value.toLowerCase();
   const imp  = document.getElementById('impFilter').value;
